@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tooling caches
+.ruff_cache/
+.pyright/
+.mypy_cache/
+.pytest_cache/
+uv.lock.bak
+
+# Environment
+.env
+.env.*
+
+# Local data (sqlite default path) and planning scratch space
+data/
+temp/

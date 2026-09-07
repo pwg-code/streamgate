@@ -1,0 +1,649 @@
+"""消费循环：批量缓冲（size/timeout 双触发）、毒丸跳过并提交、
+paused 指数退避自愈、失败分类 → DLQ 二分隔离、停机 flush。"""
+
+import asyncio
+import time
+from collections.abc import Callable
+from datetime import datetime, timezone
+
+from aiokafka.errors import CommitFailedError
+from aiokafka.structs import OffsetAndMetadata, TopicPartition
+
+from streamgate.cache.existence import RedisExistenceCache
+from streamgate.config import ConsumerConfig
+from streamgate.consumer.classifier import (
+    FailureCategory,
+    classify_write_failure,
+)
+from streamgate.consumer.dlq import (
+    BisectOutcome,
+    BufferedMessage,
+    DlqProducer,
+    DlqSendError,
+    QuarantineRequest,
+    _original_message,
+    locate_and_write,
+)
+from streamgate.obs.logging import logger
+from streamgate.obs.metrics import DEFAULT_METRICS, MetricsSink
+from streamgate.protocols import (
+    AdmissionPolicy,
+    ConsumeContext,
+    Envelope,
+    JsonObject,
+    MessageCodec,
+    RecordWriter,
+)
+from streamgate.specs import ConsumeSpec
+from streamgate.transport.kafka import KafkaConsumerService, KafkaRecord
+
+
+def _backlog_level(age_seconds: float, existence_ttl_seconds: int) -> str:
+    """积压时长告警阈值：WARN > TTL/2（窗口打开前最后干预机会）；ERROR > TTL*0.8。"""
+    if age_seconds > existence_ttl_seconds * 0.8:
+        return "error"
+    if age_seconds > existence_ttl_seconds / 2:
+        return "warning"
+    return "ok"
+
+
+class ConsumeRuntime:
+    """消费服务运行时状态（非线程安全，单 event loop 内安全）。"""
+
+    def __init__(
+        self,
+        *,
+        spec: ConsumeSpec,
+        consumer_config: ConsumerConfig,
+        writer: RecordWriter | None,
+        consumer: KafkaConsumerService | None,
+        codec: MessageCodec,
+        existence_ttl_seconds: int,
+        persist_policy: AdmissionPolicy[JsonObject] | None = None,
+        cache: RedisExistenceCache | None = None,
+        dlq: DlqProducer | None = None,
+        metrics: MetricsSink | None = None,
+    ) -> None:
+        self.spec = spec
+        self.consumer_config = consumer_config
+        self.writer = writer
+        self.consumer = consumer
+        self.codec = codec
+        self.existence_ttl_seconds = existence_ttl_seconds
+        self.persist_policy = persist_policy
+        self.cache = cache
+        self.dlq = dlq
+        self.metrics = metrics or DEFAULT_METRICS
+        self.buffer: list[BufferedMessage] = []
+        self.last_write_at: datetime | None = None
+        self.last_commit_at: datetime | None = None
+        # --- 积压时长监控 ---
+        self.backlog_oldest_ts: float | None = None      # 最老未落库消息（epoch 秒）
+        self.last_backlog_check_at: datetime | None = None
+        self.running: bool = True
+        self.paused: bool = False
+        self.recover_attempt: int = 0
+        self.reconnect_attempt: int = 0
+        # --- 坏数据隔离（DLQ）---
+        self.quarantined_count: int = 0               # 进程生命周期累计隔离条数
+
+    @property
+    def pending_count(self) -> int:
+        return len(self.buffer)
+
+    def context_snapshot(self) -> ConsumeContext:
+        """Tier 2 只读快照（位点/commit 不开放）。"""
+        backlog_age = (
+            time.time() - self.backlog_oldest_ts
+            if self.backlog_oldest_ts is not None
+            else None
+        )
+        return ConsumeContext(
+            lag=self.consumer.lag if self.consumer is not None else 0,
+            pending_count=self.pending_count,
+            paused=self.paused,
+            quarantined_count=self.quarantined_count,
+            backlog_age_seconds=backlog_age,
+        )
+
+
+def _note_backlog_ts(runtime: ConsumeRuntime, timestamp_ms: int | None) -> None:
+    """记录进入缓冲区的消息时间戳，保留最老值。
+
+    近似语义：缓冲区最老消息时间戳 = 最老未落库消息
+    （paused 期间不再 poll，缓冲区即积压下界；Kafka 侧未拉取消息只会更晚到达）。
+    """
+    if timestamp_ms is None:
+        return
+    ts = timestamp_ms / 1000.0
+    if runtime.backlog_oldest_ts is None or ts < runtime.backlog_oldest_ts:
+        runtime.backlog_oldest_ts = ts
+
+
+def _check_backlog_age(runtime: ConsumeRuntime) -> None:
+    """周期性积压检查：指标输出 + 阈值告警。"""
+    if runtime.backlog_oldest_ts is not None:
+        age = time.time() - runtime.backlog_oldest_ts
+        ttl = runtime.existence_ttl_seconds
+        fields = {
+            "backlog_age_seconds": round(age, 1),
+            "pending_count": runtime.pending_count,
+            "existence_ttl_seconds": ttl,
+        }
+        logger.info("backlog_age_seconds", **fields)
+        level = _backlog_level(age, ttl)
+        if level == "error":
+            logger.error("backlog_age_critical", **fields)
+        elif level == "warning":
+            logger.warning("backlog_age_warn", **fields)
+    _log_db_pool_stats(runtime)
+
+
+def _log_db_pool_stats(runtime: ConsumeRuntime) -> None:
+    """DB 池饱和度（checked-out / 池内总数）。异常静默（指标不打断消费）。"""
+    engine: object = getattr(runtime.writer, "_engine", None)
+    if engine is None:
+        return
+    pool = getattr(engine, "pool", None)
+    if pool is None:
+        return
+    try:
+        logger.info(
+            "db_pool_stats",
+            checkedout=pool.checkedout(),
+            pool_size=pool.size(),
+        )
+    except Exception as e:
+        logger.debug("db_pool_stats_failed", error=str(e))
+
+
+def _dedup_by_collapse_key(
+    batch: list[BufferedMessage],
+    collapse_key: Callable[[JsonObject], object],
+) -> list[BufferedMessage]:
+    """按 collapse_key 去重保留最后一条（与写库侧防御性去重同序）。"""
+    seen: dict[object, BufferedMessage] = {}
+    for m in batch:
+        seen[collapse_key(m.data)] = m  # 后者覆盖前者
+    return list(seen.values())
+
+
+async def _notify_persisted(runtime: ConsumeRuntime, batch: list[BufferedMessage]) -> None:
+    """落库成功 → 权威刷新/on_persisted 钩子（best-effort，策略内部兜底异常）。"""
+    policy = runtime.persist_policy
+    if policy is None:
+        return
+    records = (
+        _dedup_by_collapse_key(batch, runtime.spec.collapse_key)
+        if runtime.spec.collapse_key is not None
+        else batch
+    )
+    for m in records:
+        try:
+            await policy.on_persisted(m.data)
+        except Exception as e:
+            logger.warning("on_persisted_failed", error=str(e))
+
+
+async def _commit_quietly(runtime: ConsumeRuntime, batch_size: int) -> None:
+    """写库后提交位点：CommitFailed 只记日志不重试写库。"""
+    consumer = runtime.consumer
+    assert consumer is not None  # 装配点保证（prepare 必建 consumer）
+    try:
+        await consumer.commit()
+    except CommitFailedError as e:
+        logger.warning(
+            "offset_commit_failed_after_write",
+            error=str(e),
+            batch_size=batch_size,
+        )
+
+
+async def _try_write_batch(runtime: ConsumeRuntime) -> bool:
+    """尝试写入当前缓冲区。返回 True 表示成功，False 表示失败。
+
+    双路径分发：有 sink 走幂等 upsert 编排（含 DLQ 二分）；
+    无 sink（on_record 模式）处理成功即整批可提交。
+    """
+    if not runtime.buffer:
+        return True
+    if runtime.writer is None:
+        return await _try_handler_batch(runtime)
+    return await _try_upsert_batch(runtime)
+
+
+async def _try_handler_batch(runtime: ConsumeRuntime) -> bool:
+    """on_record 模式：钩子正常返回=整批可提交；抛异常=重试后 paused。
+
+    DLQ 二分不适用（无写侧可探针定位），重试耗尽转既有 paused 自愈。
+    """
+    handler = runtime.spec.on_record
+    assert handler is not None  # spec 校验保证（writer 为空必为 on_record 模式）
+    config = runtime.consumer_config
+    batch: list[BufferedMessage] = list(runtime.buffer)
+    batch_size = len(batch)
+    records = [m.data for m in batch]
+    context = runtime.context_snapshot()
+    logger.info("batch_write_start", batch_size=batch_size)
+
+    for attempt in range(config.max_retries):
+        try:
+            t0 = time.monotonic()
+            await handler(records, context)
+            duration_ms = round((time.monotonic() - t0) * 1000, 1)
+            runtime.buffer.clear()                      # 先清 buffer（已处理成功）
+            runtime.backlog_oldest_ts = None            # 积压已清（下一批重新计）
+            runtime.last_write_at = datetime.now(timezone.utc)
+            await _notify_persisted(runtime, batch)
+            await _commit_quietly(runtime, batch_size)
+            runtime.last_commit_at = datetime.now(timezone.utc)
+            logger.info(
+                "batch_write_success",
+                batch_size=batch_size,
+                duration_ms=duration_ms,
+            )
+            return True
+        except Exception as e:
+            backoff = config.retry_backoff_base * (2 ** attempt)
+            logger.error(
+                "batch_write_failed",
+                error=str(e),
+                batch_size=batch_size,
+                retry_count=attempt + 1,
+                max_retries=config.max_retries,
+                backoff_seconds=backoff,
+            )
+            if attempt < config.max_retries - 1:
+                await asyncio.sleep(backoff)
+
+    logger.error(
+        "batch_write_exhausted_retries",
+        batch_size=batch_size,
+        max_retries=config.max_retries,
+    )
+    return False
+
+
+async def _try_upsert_batch(runtime: ConsumeRuntime) -> bool:
+    """upsert 模式：重试写库 → 耗尽后分类处置（paused 或 DLQ 二分隔离）。"""
+    writer = runtime.writer
+    assert writer is not None  # 分发点保证
+    config = runtime.consumer_config
+    batch: list[BufferedMessage] = list(runtime.buffer)
+    batch_size = len(batch)
+    logger.info("batch_write_start", batch_size=batch_size)
+
+    last_error: Exception | None = None
+    for attempt in range(config.max_retries):
+        try:
+            t0 = time.monotonic()
+            result = await writer.write([m.data for m in batch])
+            duration_ms = round((time.monotonic() - t0) * 1000, 1)  # 写耗时指标
+            runtime.last_write_at = datetime.now(timezone.utc)
+            runtime.buffer.clear()                      # 先清 buffer（数据已落库）
+            runtime.backlog_oldest_ts = None            # 积压已清（下一批重新计）
+            # 权威刷新 / on_persisted（失败仅 WARN）
+            await _notify_persisted(runtime, batch)
+            await _commit_quietly(runtime, batch_size)  # 再 commit，失败只记日志
+            runtime.last_commit_at = datetime.now(timezone.utc)
+            logger.info(
+                "batch_write_success",
+                batch_size=batch_size,
+                **{f"{name}_count": count for name, count in result.counts.items()},
+                duration_ms=duration_ms,                # 写耗时
+            )
+            return True
+        except Exception as e:
+            last_error = e
+            backoff = config.retry_backoff_base * (2**attempt)
+            logger.error(
+                "batch_write_failed",
+                error=str(e),
+                batch_size=batch_size,
+                retry_count=attempt + 1,
+                max_retries=config.max_retries,
+                backoff_seconds=backoff,
+            )
+            if attempt < config.max_retries - 1:
+                await asyncio.sleep(backoff)
+
+    return await _handle_write_failure(runtime, writer, batch, last_error)
+
+
+async def _handle_write_failure(
+    runtime: ConsumeRuntime,
+    writer: RecordWriter,
+    batch: list[BufferedMessage],
+    last_error: Exception | None,
+) -> bool:
+    """重试耗尽后的失败分类处置：paused 自愈 或 二分定位隔离。
+
+    writer 由 _try_upsert_batch 收窄后显式传入（此路径必有写侧）。
+    """
+    config = runtime.consumer_config
+    logger.error(
+        "batch_write_exhausted_retries",
+        batch_size=len(batch),
+        max_retries=config.max_retries,
+    )
+    if last_error is None:
+        return False  # 理论不可达（耗尽必经 except），防御分支
+    dlq = runtime.dlq
+    if dlq is None or not config.dlq_enabled:
+        return False  # 逃生门 CONSUMER__DLQ_ENABLED=false / 未接线：paused 旧行为
+    category = classify_write_failure(last_error)
+    logger.info(
+        "write_failure_classified", category=category.value, error=str(last_error)
+    )
+    if category is FailureCategory.INFRASTRUCTURE:
+        return False  # 基础设施类 paused 自愈，语义完全不变
+    # 数据类/未知类 → 二分定位（探针对照，防误隔离）
+    logger.warning(
+        "batch_bisect_triggered",
+        batch_size=len(batch),
+        category=category.value,
+        error=str(last_error),
+    )
+    try:
+        outcome = await locate_and_write(
+            writer, dlq, batch, category, str(last_error)
+        )
+    except DlqSendError:
+        # dlq_send_failed 已由 DlqProducer 记日志；批次不提交 offset、转 paused
+        # 下轮整体重试（好条幂等重写，坏条重复隔离仅 DLQ 多一条，可接受）
+        return False
+    if outcome is None:
+        return False  # 探针失败 → 疑似 DB 故障 → paused（不隔离任何数据）
+    return await _finalize_bisect_outcome(runtime, batch, outcome)
+
+
+async def _finalize_bisect_outcome(
+    runtime: ConsumeRuntime,
+    batch: list[BufferedMessage],
+    outcome: BisectOutcome,
+) -> bool:
+    """定位完成：好条已入库、坏条已隔离，按成功等价收尾。"""
+    runtime.buffer.clear()
+    runtime.backlog_oldest_ts = None
+    runtime.last_write_at = datetime.now(timezone.utc)
+    runtime.quarantined_count += len(outcome.quarantined)
+    for q in outcome.quarantined:
+        log_ctx = (
+            runtime.spec.log_context(q.message.data)
+            if runtime.spec.log_context is not None
+            else {}
+        )
+        logger.error(
+            "consumer_record_quarantined",
+            **log_ctx,
+            partition=q.request.partition,
+            offset=q.request.offset,
+            reason=q.request.category,
+            error=q.request.error,
+        )
+    if outcome.written:
+        # 只刷新实际入库的好条；被隔离条不动占位（
+        # 占位残留 + 后续 409 是正确终态，阻止坏数据静默循环重灌）
+        await _notify_persisted(runtime, outcome.written)
+    await _commit_quietly(runtime, len(batch))
+    runtime.last_commit_at = datetime.now(timezone.utc)
+    logger.info(
+        "batch_write_success_with_quarantine",
+        batch_size=len(batch),
+        written=len(outcome.written),
+        quarantined=len(outcome.quarantined),
+    )
+    return True
+
+
+def _write_timeout_due(runtime: ConsumeRuntime) -> bool:
+    """缓冲区非空且距上次写入超过 batch_timeout_seconds。"""
+    config = runtime.consumer_config
+    if not (runtime.buffer and runtime.last_write_at):
+        return False
+    elapsed = (
+        datetime.now(timezone.utc) - runtime.last_write_at
+    ).total_seconds()
+    return elapsed >= config.batch_timeout_seconds
+
+
+async def _trigger_write(runtime: ConsumeRuntime) -> bool:
+    """触发一次写入；失败转 paused（超时/条数触发路径共用）。"""
+    success = await _try_write_batch(runtime)
+    if not success:
+        runtime.paused = True
+        logger.error("consumer_paused_due_to_write_failures")
+    return success
+
+
+async def _paused_recovery_tick(runtime: ConsumeRuntime) -> None:
+    """暂停状态下的恢复写入（指数退避，上限 reconnect_max_backoff_seconds）。"""
+    config = runtime.consumer_config
+    backoff = min(
+        config.reconnect_max_backoff_seconds,
+        config.reconnect_base_backoff_seconds
+        * (2 ** min(runtime.recover_attempt, 5)),
+    )
+    logger.info(
+        "consumer_paused_retry",
+        attempt=runtime.recover_attempt + 1,
+        backoff_seconds=backoff,
+    )
+    await asyncio.sleep(backoff)
+    if await _try_write_batch(runtime):
+        runtime.paused = False
+        runtime.recover_attempt = 0
+        logger.info("consumer_resumed_after_recovery")
+    else:
+        runtime.recover_attempt += 1
+
+
+async def _ensure_consumer_ready(runtime: ConsumeRuntime) -> bool:
+    """consumer 未启动时重连（指数退避）。返回 False = 本轮跳过后续步骤。"""
+    consumer = runtime.consumer
+    if consumer is None:
+        logger.error("consumer_not_initialized")
+        await asyncio.sleep(1.0)
+        return False
+    if consumer.started:
+        return True
+    config = runtime.consumer_config
+    try:
+        await consumer.start()
+        runtime.reconnect_attempt = 0
+        return True
+    except Exception as e:
+        runtime.reconnect_attempt += 1
+        backoff = min(
+            config.reconnect_max_backoff_seconds,
+            config.reconnect_base_backoff_seconds
+            * (2 ** min(runtime.reconnect_attempt - 1, 5)),
+        )
+        logger.error(
+            "kafka_reconnect_failed",
+            error=str(e),
+            attempt=runtime.reconnect_attempt,
+            backoff_seconds=backoff,
+        )
+        await asyncio.sleep(backoff)
+        return False
+
+
+async def _poll_records(runtime: ConsumeRuntime) -> list[KafkaRecord] | None:
+    """拉取一批消息；poll 异常时退避 1s（返回 None = 本轮跳过）。"""
+    consumer = runtime.consumer
+    assert consumer is not None  # 仅在 _ensure_consumer_ready 通过后调用
+    try:
+        return await consumer.poll()
+    except Exception as e:
+        logger.error("kafka_poll_error", error=str(e))
+        await asyncio.sleep(1.0)
+        return None
+
+
+async def _quarantine_type_mismatch(
+    runtime: ConsumeRuntime,
+    record: KafkaRecord,
+    envelope: Envelope,
+) -> None:
+    """未知 type 前向兼容——隔离至 DLQ 推进位点，不 crash 不循环。"""
+    if runtime.dlq is not None:
+        request = _build_type_mismatch_request(record, envelope)
+        try:
+            await runtime.dlq.quarantine(request)
+            runtime.quarantined_count += 1
+            return
+        except DlqSendError:
+            logger.error(
+                "unknown_type_dlq_failed",
+                partition=record.partition,
+                offset=record.offset,
+                message_type=envelope.type,
+            )
+            return
+    logger.error(
+        "unknown_type_skipped",
+        partition=record.partition,
+        offset=record.offset,
+        message_type=envelope.type,
+    )
+
+
+async def _process_record(
+    runtime: ConsumeRuntime,
+    record: KafkaRecord,
+    poison_offsets: dict[TopicPartition, OffsetAndMetadata],
+) -> None:
+    """单条消息处理：毒丸/未知 type → 推进位点；合法消息 → 入缓冲区。"""
+    value = record.value
+    envelope = runtime.codec.decode(value)
+    if envelope is None or value is None:
+        logger.error(
+            "poison_message_skipped",
+            partition=record.partition,
+            offset=record.offset,
+            raw_message=value[:500] if value else "",
+        )
+        tp = TopicPartition(record.topic, record.partition)
+        poison_offsets[tp] = OffsetAndMetadata(record.offset + 1, "")
+        return
+    if (
+        runtime.spec.expected_message_type is not None
+        and envelope.type is not None
+        and envelope.type != runtime.spec.expected_message_type
+    ):
+        await _quarantine_type_mismatch(runtime, record, envelope)
+        tp = TopicPartition(record.topic, record.partition)
+        poison_offsets[tp] = OffsetAndMetadata(record.offset + 1, "")
+        return
+    # 消息源信息随数据入缓冲区：DLQ 隔离需要 partition/offset/key 与
+    # 原始消息全文（完整转发），data 本身不含这些（decode 只提取 data 字段）
+    runtime.buffer.append(
+        BufferedMessage(
+            data=envelope.data,
+            partition=record.partition,
+            offset=record.offset,
+            key=record.key,
+            raw_value=value,
+        )
+    )
+    _note_backlog_ts(runtime, record.timestamp)  # 追最老未落库消息
+
+
+async def _consume_records(
+    runtime: ConsumeRuntime,
+    records: list[KafkaRecord],
+) -> None:
+    """整批消息处理 + 毒丸位点提交（推进消费位点，避免重启后重复处理）。"""
+    poison_offsets: dict[TopicPartition, OffsetAndMetadata] = {}
+    for record in records:
+        await _process_record(runtime, record, poison_offsets)
+    if poison_offsets:
+        consumer = runtime.consumer
+        assert consumer is not None
+        try:
+            await consumer.commit(poison_offsets)
+            logger.info("poison_offsets_committed", count=len(poison_offsets))
+        except CommitFailedError as e:
+            logger.warning("poison_offset_commit_failed", error=str(e))
+
+
+async def _periodic_backlog_check(runtime: ConsumeRuntime, config: ConsumerConfig) -> None:
+    """周期性积压/池指标检查（含 paused 状态，DB 故障期最需要）+ lag 真实化。"""
+    now_dt = datetime.now(timezone.utc)
+    if (
+        runtime.last_backlog_check_at is not None
+        and (now_dt - runtime.last_backlog_check_at).total_seconds()
+        < config.backlog_check_interval_seconds
+    ):
+        return
+    runtime.last_backlog_check_at = now_dt
+    _check_backlog_age(runtime)
+    # R4：lag 真实化（与积压检查同周期计算，健康接口只读缓存值）
+    consumer = runtime.consumer
+    if consumer is not None:
+        try:
+            await consumer.refresh_lag()
+        except Exception:
+            logger.debug("lag_refresh_skipped", exc_info=True)
+
+
+async def consume_loop(runtime: ConsumeRuntime) -> None:
+    """主消费循环。"""
+    config = runtime.consumer_config
+    runtime.running = True
+    # 初始化为当前时间，避免首批消息不足 batch_size 时超时检查因 last_write_at=None 永不触发
+    runtime.last_write_at = datetime.now(timezone.utc)
+
+    logger.info(
+        "consumer_loop_started",
+        group_id=config.group_id,
+        batch_size=config.batch_size,
+        batch_timeout=config.batch_timeout_seconds,
+    )
+
+    while runtime.running:
+        await _periodic_backlog_check(runtime, config)
+
+        if runtime.paused:
+            # 暂停状态下尝试恢复写库（指数退避，上限 reconnect_max_backoff_seconds）
+            await _paused_recovery_tick(runtime)
+            continue
+
+        # 若 consumer 未启动，尝试重连（指数退避，上限 reconnect_max_backoff_seconds）
+        if not await _ensure_consumer_ready(runtime):
+            continue
+
+        # 检查是否该触发写入（超时）
+        if _write_timeout_due(runtime) and not await _trigger_write(runtime):
+            continue
+
+        # 拉取消息
+        records = await _poll_records(runtime)
+        if records is not None:
+            await _consume_records(runtime, records)
+
+        # 检查是否该触发写入（条数）
+        if len(runtime.buffer) >= config.batch_size:
+            await _trigger_write(runtime)
+
+    # 优雅停机：写完缓冲区剩余数据
+    if runtime.buffer:
+        logger.info("shutdown_flushing_buffer", pending=len(runtime.buffer))
+        await _try_write_batch(runtime)
+
+    logger.info("consumer_loop_stopped")
+
+
+def _build_type_mismatch_request(
+    record: KafkaRecord, envelope: Envelope
+) -> QuarantineRequest:
+    return QuarantineRequest(
+        partition=record.partition,
+        offset=record.offset,
+        key=record.key,
+        original_message=_original_message(record.value),
+        category="unknown_type",
+        error=f"unexpected envelope type: {envelope.type}",
+        stage="decode",
+    )
