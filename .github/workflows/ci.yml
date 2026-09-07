@@ -40,7 +40,7 @@ jobs:
         run: |
           uv venv bare
           uv pip install --python bare/bin/python .
-      - name: Smoke: bare import, extras gating, required connection string
+      - name: "Smoke: bare import, extras gating, required connection string"
         run: |
           bare/bin/python - <<'EOF'
           import streamgate
