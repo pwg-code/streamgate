@@ -1,5 +1,6 @@
 """消费循环：批量缓冲（size/timeout 双触发）、毒丸跳过并提交、
-paused 指数退避自愈、失败分类 → DLQ 二分隔离、停机 flush。"""
+paused 指数退避自愈、ErrorClassifier 分类 → RETRY/POISON/FATAL 三路处置、
+DLQ 二分隔离、停机 flush。"""
 
 import asyncio
 import time
@@ -9,12 +10,8 @@ from datetime import datetime, timezone
 from aiokafka.errors import CommitFailedError
 from aiokafka.structs import OffsetAndMetadata, TopicPartition
 
-from streamgate.cache.existence import RedisExistenceCache
 from streamgate.config import ConsumerConfig
-from streamgate.consumer.classifier import (
-    FailureCategory,
-    classify_write_failure,
-)
+from streamgate.consumer.classifier import DefaultErrorClassifier
 from streamgate.consumer.dlq import (
     BisectOutcome,
     BufferedMessage,
@@ -30,6 +27,8 @@ from streamgate.protocols import (
     AdmissionPolicy,
     ConsumeContext,
     Envelope,
+    ErrorClassifier,
+    ErrorKind,
     JsonObject,
     MessageCodec,
     RecordWriter,
@@ -60,9 +59,10 @@ class ConsumeRuntime:
         codec: MessageCodec,
         existence_ttl_seconds: int,
         persist_policy: AdmissionPolicy[JsonObject] | None = None,
-        cache: RedisExistenceCache | None = None,
+        cache: object | None = None,
         dlq: DlqProducer | None = None,
         metrics: MetricsSink | None = None,
+        error_classifier: ErrorClassifier | None = None,
     ) -> None:
         self.spec = spec
         self.consumer_config = consumer_config
@@ -74,6 +74,7 @@ class ConsumeRuntime:
         self.cache = cache
         self.dlq = dlq
         self.metrics = metrics or DEFAULT_METRICS
+        self.error_classifier = error_classifier or DefaultErrorClassifier()
         self.buffer: list[BufferedMessage] = []
         self.last_write_at: datetime | None = None
         self.last_commit_at: datetime | None = None
@@ -136,25 +137,6 @@ def _check_backlog_age(runtime: ConsumeRuntime) -> None:
             logger.error("backlog_age_critical", **fields)
         elif level == "warning":
             logger.warning("backlog_age_warn", **fields)
-    _log_db_pool_stats(runtime)
-
-
-def _log_db_pool_stats(runtime: ConsumeRuntime) -> None:
-    """DB 池饱和度（checked-out / 池内总数）。异常静默（指标不打断消费）。"""
-    engine: object = getattr(runtime.writer, "_engine", None)
-    if engine is None:
-        return
-    pool = getattr(engine, "pool", None)
-    if pool is None:
-        return
-    try:
-        logger.info(
-            "db_pool_stats",
-            checkedout=pool.checkedout(),
-            pool_size=pool.size(),
-        )
-    except Exception as e:
-        logger.debug("db_pool_stats_failed", error=str(e))
 
 
 def _dedup_by_collapse_key(
@@ -212,10 +194,17 @@ async def _try_write_batch(runtime: ConsumeRuntime) -> bool:
     return await _try_upsert_batch(runtime)
 
 
-async def _try_handler_batch(runtime: ConsumeRuntime) -> bool:
-    """on_record 模式：钩子正常返回=整批可提交；抛异常=重试后 paused。
+def _abort_fatal(runtime: ConsumeRuntime, exc: Exception) -> None:
+    """FATAL 处置：停机告警（消费循环退出，交由进程管理器/人工介入）。"""
+    logger.error("consumer_fatal_error_stopping", error=str(exc))
+    runtime.running = False
 
-    DLQ 二分不适用（无写侧可探针定位），重试耗尽转既有 paused 自愈。
+
+async def _try_handler_batch(runtime: ConsumeRuntime) -> bool:
+    """on_record 模式：钩子正常返回=整批可提交；抛异常=按分类处置。
+
+    RETRY 退避重试；POISON/FATAL 停止重试。DLQ 二分不适用（无写侧可
+    探针定位），POISON 同样转既有 paused 自愈（仅省去无意义重试）。
     """
     handler = runtime.spec.on_record
     assert handler is not None  # spec 校验保证（writer 为空必为 on_record 模式）
@@ -244,6 +233,7 @@ async def _try_handler_batch(runtime: ConsumeRuntime) -> bool:
             )
             return True
         except Exception as e:
+            kind = runtime.error_classifier.classify(e, attempt)
             backoff = config.retry_backoff_base * (2 ** attempt)
             logger.error(
                 "batch_write_failed",
@@ -252,7 +242,13 @@ async def _try_handler_batch(runtime: ConsumeRuntime) -> bool:
                 retry_count=attempt + 1,
                 max_retries=config.max_retries,
                 backoff_seconds=backoff,
+                error_kind=kind.value,
             )
+            if kind is ErrorKind.FATAL:
+                _abort_fatal(runtime, e)
+                return False
+            if kind is ErrorKind.POISON:
+                break  # 无写侧不可二分：直接转 paused（重试毒批无意义）
             if attempt < config.max_retries - 1:
                 await asyncio.sleep(backoff)
 
@@ -265,7 +261,8 @@ async def _try_handler_batch(runtime: ConsumeRuntime) -> bool:
 
 
 async def _try_upsert_batch(runtime: ConsumeRuntime) -> bool:
-    """upsert 模式：重试写库 → 耗尽后分类处置（paused 或 DLQ 二分隔离）。"""
+    """sink 模式：按 ErrorClassifier 分类处置——
+    RETRY 退避重试 → POISON 立即转 DLQ 二分隔离 → FATAL 停机。"""
     writer = runtime.writer
     assert writer is not None  # 分发点保证
     config = runtime.consumer_config
@@ -273,7 +270,7 @@ async def _try_upsert_batch(runtime: ConsumeRuntime) -> bool:
     batch_size = len(batch)
     logger.info("batch_write_start", batch_size=batch_size)
 
-    last_error: Exception | None = None
+    poison_error: Exception | None = None
     for attempt in range(config.max_retries):
         try:
             t0 = time.monotonic()
@@ -294,7 +291,7 @@ async def _try_upsert_batch(runtime: ConsumeRuntime) -> bool:
             )
             return True
         except Exception as e:
-            last_error = e
+            kind = runtime.error_classifier.classify(e, attempt)
             backoff = config.retry_backoff_base * (2**attempt)
             logger.error(
                 "batch_write_failed",
@@ -303,22 +300,37 @@ async def _try_upsert_batch(runtime: ConsumeRuntime) -> bool:
                 retry_count=attempt + 1,
                 max_retries=config.max_retries,
                 backoff_seconds=backoff,
+                error_kind=kind.value,
             )
+            if kind is ErrorKind.FATAL:
+                _abort_fatal(runtime, e)
+                return False
+            if kind is ErrorKind.POISON:
+                poison_error = e  # 毒批：重试无意义，立即转二分隔离
+                break
             if attempt < config.max_retries - 1:
                 await asyncio.sleep(backoff)
 
-    return await _handle_write_failure(runtime, writer, batch, last_error)
+    if poison_error is not None:
+        return await _handle_write_failure(runtime, writer, batch, poison_error)
+    logger.error(
+        "batch_write_exhausted_retries",
+        batch_size=batch_size,
+        max_retries=config.max_retries,
+    )
+    return False  # RETRY 耗尽：paused 自愈
 
 
 async def _handle_write_failure(
     runtime: ConsumeRuntime,
     writer: RecordWriter,
     batch: list[BufferedMessage],
-    last_error: Exception | None,
+    poison_error: Exception,
 ) -> bool:
-    """重试耗尽后的失败分类处置：paused 自愈 或 二分定位隔离。
+    """POISON 处置：DLQ 二分定位隔离（探针对照，防误隔离）。
 
     writer 由 _try_upsert_batch 收窄后显式传入（此路径必有写侧）。
+    分类器已判定 POISON（重试无意义），此处只决定"能否隔离"：
     """
     config = runtime.consumer_config
     logger.error(
@@ -326,34 +338,29 @@ async def _handle_write_failure(
         batch_size=len(batch),
         max_retries=config.max_retries,
     )
-    if last_error is None:
-        return False  # 理论不可达（耗尽必经 except），防御分支
     dlq = runtime.dlq
     if dlq is None or not config.dlq_enabled:
         return False  # 逃生门 CONSUMER__DLQ_ENABLED=false / 未接线：paused 旧行为
-    category = classify_write_failure(last_error)
     logger.info(
-        "write_failure_classified", category=category.value, error=str(last_error)
+        "write_failure_classified",
+        category=ErrorKind.POISON.value,
+        error=str(poison_error),
     )
-    if category is FailureCategory.INFRASTRUCTURE:
-        return False  # 基础设施类 paused 自愈，语义完全不变
-    # 数据类/未知类 → 二分定位（探针对照，防误隔离）
     logger.warning(
         "batch_bisect_triggered",
         batch_size=len(batch),
-        category=category.value,
-        error=str(last_error),
+        error=str(poison_error),
     )
     try:
         outcome = await locate_and_write(
-            writer, dlq, batch, category, str(last_error)
+            writer, dlq, batch, ErrorKind.POISON, str(poison_error)
         )
     except DlqSendError:
         # dlq_send_failed 已由 DlqProducer 记日志；批次不提交 offset、转 paused
         # 下轮整体重试（好条幂等重写，坏条重复隔离仅 DLQ 多一条，可接受）
         return False
     if outcome is None:
-        return False  # 探针失败 → 疑似 DB 故障 → paused（不隔离任何数据）
+        return False  # 探针失败 → 疑似存储故障 → paused（不隔离任何数据）
     return await _finalize_bisect_outcome(runtime, batch, outcome)
 
 
@@ -408,9 +415,9 @@ def _write_timeout_due(runtime: ConsumeRuntime) -> bool:
 
 
 async def _trigger_write(runtime: ConsumeRuntime) -> bool:
-    """触发一次写入；失败转 paused（超时/条数触发路径共用）。"""
+    """触发一次写入；失败转 paused（超时/条数触发路径共用；FATAL 已停机则不再标 paused）。"""
     success = await _try_write_batch(runtime)
-    if not success:
+    if not success and runtime.running:
         runtime.paused = True
         logger.error("consumer_paused_due_to_write_failures")
     return success

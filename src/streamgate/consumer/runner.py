@@ -1,6 +1,6 @@
 """消费服务装配与生命周期（机制内核，无 HTTP 呈现）。
 
-职责：init sink（可选）→ 启动缓存/consumer/DLQ → 消费循环 →
+职责：init sink（spec.sink，唯一落库路径）→ 启动 consumer/DLQ → 消费循环 →
 优雅停机（flush 缓冲、leave group、关资源）→ 健康快照。
 健康数据经 health_snapshot() 暴露；端点实现归使用方。
 """
@@ -8,20 +8,11 @@
 import asyncio
 import signal
 
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-)
-
-from streamgate.cache.existence import RedisExistenceCache
-from streamgate.config import ConsumerConfig, DbConfig, KafkaConfig, RedisConfig
+from streamgate.config import ConsumerConfig, KafkaConfig
 from streamgate.consumer.dlq import DlqProducer
 from streamgate.consumer.loop import ConsumeRuntime, consume_loop
-from streamgate.db.engines import async_session_factory, create_write_engine
-from streamgate.db.upsert import UpsertWriter
 from streamgate.obs.logging import logger
-from streamgate.protocols import MessageCodec, RecordWriter
+from streamgate.protocols import ErrorClassifier, MessageCodec
 from streamgate.resilience.health import (
     ConsumerHealthResponse,
     collect_consumer_health,
@@ -29,6 +20,9 @@ from streamgate.resilience.health import (
 from streamgate.specs import ConsumeSpec
 from streamgate.transport.codec import JsonEnvelopeCodec
 from streamgate.transport.kafka import KafkaConsumerService
+
+# 积压告警阈值基准（无注入载体 TTL 时的默认预算，行为与历史一致）
+DEFAULT_EXISTENCE_TTL_SECONDS = 18000
 
 
 class ConsumerWorker:
@@ -38,49 +32,34 @@ class ConsumerWorker:
         *,
         kafka_config: KafkaConfig,
         consumer_config: ConsumerConfig,
-        db_config: DbConfig | None = None,
-        redis_config: RedisConfig | None = None,
-        cache: RedisExistenceCache | None = None,
-        writer: RecordWriter | None = None,
-        engine: AsyncEngine | None = None,
-        session_factory: async_sessionmaker[AsyncSession] | None = None,
         codec: MessageCodec | None = None,
+        cache: object | None = None,
         existence_ttl_seconds: int | None = None,
+        error_classifier: ErrorClassifier | None = None,
     ) -> None:
+        """装配消费内核。
+
+        cache：可选健康探测组件（鸭子类型：实现 check_health() 即被
+        /health 快照观测，如使用方自建的准入缓存）。
+        error_classifier：写侧异常分类器注入点；未注入用
+        DefaultErrorClassifier（只认通用异常——接 DB 务必注入对应分类器，
+        参考 examples/sqlite_sink/）。
+        """
         self.spec = spec
         self._kafka_config = kafka_config
         self._consumer_config = consumer_config
-        self._db_config = db_config
-        self._redis_config = redis_config
         self._cache = cache
-        self._writer = writer
-        self._engine = engine
-        self._session_factory = session_factory
         self._codec = codec or JsonEnvelopeCodec()
         self._existence_ttl_seconds = (
             existence_ttl_seconds
             if existence_ttl_seconds is not None
-            else (redis_config.existence_ttl_seconds if redis_config is not None else 18000)
+            else DEFAULT_EXISTENCE_TTL_SECONDS
         )
+        self._error_classifier = error_classifier
         self.runtime: ConsumeRuntime | None = None
         self._stop_event: asyncio.Event | None = None
 
     # ---- 装配 ----
-
-    def _resolve_writer(self) -> RecordWriter | None:
-        """落地目标解析：显式 sink 优先；upserts 非空时构建内置 UpsertWriter；
-        on_record 模式返回 None（无写侧）。"""
-        if self._writer is not None:
-            return self._writer
-        if not self.spec.upserts:
-            return None
-        if self._db_config is None:
-            raise ValueError(
-                "db_config is required when ConsumeSpec.upserts is set"
-            )
-        engine = self._engine or create_write_engine(self._db_config)
-        factory = self._session_factory or async_session_factory(engine)
-        return UpsertWriter(self._db_config, engine, factory, self.spec.upserts)
 
     def _build_dlq(self) -> DlqProducer | None:
         """DLQ 隔离 producer（启动失败仅记日志，懒启动在 quarantine 兜底）。"""
@@ -103,13 +82,9 @@ class ConsumerWorker:
         if self.runtime is not None:
             return self.runtime
 
-        writer = self._resolve_writer()
+        writer = self.spec.sink
         if writer is not None:
             await writer.start()
-
-        cache = self._cache
-        if cache is not None:
-            await cache.start()
 
         # 初始化 Kafka consumer（启动失败不 crash，交给消费循环重连）
         consumer = KafkaConsumerService(
@@ -138,8 +113,9 @@ class ConsumerWorker:
             codec=self._codec,
             existence_ttl_seconds=self._existence_ttl_seconds,
             persist_policy=self.spec.persist_policy,
-            cache=cache,
+            cache=self._cache,
             dlq=dlq,
+            error_classifier=self._error_classifier,
         )
         return self.runtime
 
@@ -208,7 +184,9 @@ class ConsumerWorker:
         if runtime.dlq is not None:
             await runtime.dlq.stop()
         if runtime.cache is not None:
-            await runtime.cache.close()
+            close = getattr(runtime.cache, "close", None)
+            if close is not None:
+                await close()
         if runtime.writer is not None:
             await runtime.writer.close()
 

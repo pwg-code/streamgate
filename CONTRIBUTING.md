@@ -25,9 +25,10 @@ uv build                   # wheel + sdist build
 
 ## Scope and conventions
 
-- **Mechanisms vs. policies.** The package owns mechanisms (admission plumbing, delivery, backpressure, self-healing). Policy choices (entity/slot semantics, schemas, sink targets) belong to users. PRs should keep this boundary.
+- **Mechanisms vs. policies.** The package owns mechanisms (admission orchestration, delivery, backpressure, self-healing). Policy choices (entity/slot semantics, schemas, storage carriers) belong to users. PRs should keep this boundary.
+- **Pure-core gate.** The package must never import `sqlalchemy`, `sqlmodel`, `redis`, `aiosqlite`, `aioodbc` or `httpx` — enforced by the import-linter forbidden contract in `pyproject.toml` (`[tool.importlinter]`). I/O strategy implementations belong in `examples/` as copy-paste code. If you add a protocol extension point, add or update a runnable example for it in the same PR.
+- **Examples are the storefront.** Code in `examples/` is held to the same quality bar as the package itself: CI runs lint and typecheck over it, and example READMEs must match reality. Rotting examples rot the project.
 - **Architecture gate.** The layering contract in `pyproject.toml` (`[tool.importlinter]`) is enforced: higher layers may import lower layers, never the reverse. If your change legitimately needs a new edge, update the contract in the same PR and explain why.
-- **Optional extras.** Database drivers, `redis` and `httpx` must never be imported at module top level; load them via `streamgate._optional.require_optional` at the point of use so a bare install keeps working.
 - **Comments language.** Internal docstrings/comments are written in Chinese and kept that way. Docstrings on public API symbols (exported from `streamgate.__init__`) should be English-friendly.
 - **No test suite yet.** The project currently ships without tests (top roadmap item). Until then, please include a minimal reproduction script (or a runnable snippet) with bug reports and behavioral PRs so reviewers can verify against real data.
 - **Changelog.** User-visible changes must update `CHANGELOG.md`.

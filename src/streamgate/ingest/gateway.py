@@ -8,13 +8,9 @@ IngestOutcome，不抛 HTTP 异常、不构造 Response。日志事件名与字�
 from datetime import datetime, timezone
 from typing import Generic
 
-from streamgate.cache.existence import RedisExistenceCache
-from streamgate.config import BackpressureConfig, DbConfig, KafkaConfig, RedisConfig
+from streamgate.config import BackpressureConfig, KafkaConfig
+from streamgate.ingest.admission.in_memory import InMemoryAdmission
 from streamgate.ingest.admission.no_admission import NoAdmission
-from streamgate.ingest.admission.redis_existence import (
-    RedisExistenceAdmission,
-    RedisExistenceAdmissionConfig,
-)
 from streamgate.ingest.producer import KafkaProducerService
 from streamgate.obs.logging import logger
 from streamgate.protocols import (
@@ -26,7 +22,7 @@ from streamgate.protocols import (
     JsonObject,
     MessageCodec,
 )
-from streamgate.resilience.backpressure import HttpProbeSignal
+from streamgate.resilience.backpressure import ManualBackpressureSignal
 from streamgate.resilience.health import (
     IngestHealthResponse,
     collect_ingest_health,
@@ -50,16 +46,12 @@ class IngestGateway(Generic[IngestRecordT]):
         backpressure_config: BackpressureConfig,
         signal: BackpressureSignal | None = None,
         codec: MessageCodec | None = None,
-        db_config: DbConfig | None = None,
-        redis_config: RedisConfig | None = None,
     ) -> None:
         self.binding = binding
         self._kafka_config = kafka_config
         self._backpressure_config = backpressure_config
-        self._redis_config = redis_config
-        self._db_config = db_config
         self._codec = codec or JsonEnvelopeCodec()
-        self._signal = signal or HttpProbeSignal(backpressure_config)
+        self._signal = signal or ManualBackpressureSignal()
         self._admission = self._resolve_admission()
         self._producer: KafkaProducerService | None = None
         self._started = False
@@ -77,29 +69,14 @@ class IngestGateway(Generic[IngestRecordT]):
             return admission
         if admission == "none":
             return NoAdmission()
-        if admission == "redis-existence":
-            # 字符串形态只能装配纯缓存判定（无回源）；
-            # 需要冷实体回源时注入 RedisExistenceAdmission 实例（携带 BackfillSource）
+        if admission == "in-memory":
+            # 纯内存唯一性准入（仅单进程有效；多实例拓扑请注入
+            # 共享存储载体，Redis 参考实现见 examples/redis_admission/）
             binding = self.binding
-            return RedisExistenceAdmission(
-                cache=RedisExistenceCache(self._redis_config or RedisConfig()),
+            return InMemoryAdmission(
                 entity_key=binding.entity_key,
                 slot_key=binding.slot_key,
                 summary=binding.summary,
-                backfill=None,
-                config=RedisExistenceAdmissionConfig(
-                    cold_path_max_concurrency=(
-                        self._db_config.cold_path_max_concurrency
-                        if self._db_config is not None
-                        else 5
-                    ),
-                    gate_full_retry_after_seconds=(
-                        self._db_config.cold_path_gate_retry_after_seconds
-                        if self._db_config is not None
-                        else 1
-                    ),
-                ),
-                redis_config=self._redis_config,
             )
         raise ValueError(f"unknown admission shortcut: {admission!r}")
 
@@ -120,7 +97,6 @@ class IngestGateway(Generic[IngestRecordT]):
             logger.warning("startup_with_degraded_kafka")
         self._producer = producer
         await self._admission.start()
-        await self._log_db_probe()
         self._warn_if_trip_exceeds_ttl()
         await self._signal.start()
         self._started = True
@@ -135,17 +111,6 @@ class IngestGateway(Generic[IngestRecordT]):
             await producer.stop()
         await self._admission.close()
         self._started = False
-
-    async def _log_db_probe(self) -> None:
-        """启动期数据库连接探测：成功 INFO / 失败 ERROR（不 crash，冷实体回源时降级）。"""
-        db_config = self._db_config
-        engine = db_config.dialect if db_config is not None else "unknown"
-        url = db_config.redacted_connection_string if db_config is not None else ""
-        db_ok, db_err = await self._admission.check_backfill_health_detail()
-        if db_ok:
-            logger.info("db_connected", engine=engine, url=url)
-        else:
-            logger.error("db_connection_failed", engine=engine, url=url, error=db_err)
 
     def _warn_if_trip_exceeds_ttl(self) -> None:
         """背压拒绝（consumption-backpressure）：启动期 TTL 预算校验。"""

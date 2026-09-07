@@ -8,17 +8,16 @@ underscore):
 |--------|---------------|
 | `KAFKA__` | `KafkaConfig` |
 | `CONSUMER__` | `ConsumerConfig` |
-| `DB__` | `DbConfig` |
-| `REDIS__` | `RedisConfig` |
 | `BACKPRESSURE__` | `BackpressureConfig` |
 
 **Fail-fast semantics:** required settings are not defaulted. If a required value
 is missing, assembly fails at startup with an error that names the setting and
 how to fix it — the process never runs with project-specific guessed defaults.
 
-Extras annotations: fields that require a database or Redis **connection** only
-take effect when the matching extra is installed — `[sqlite]`, `[mssql]` or
-`[redis]`. A pure Kafka pipeline (`pip install streamgate`) needs none of them.
+Database and Redis connection settings are **not part of the framework**:
+storage carriers are injected via protocols and their configuration belongs to
+your application (see the example-local configs in `examples/sqlite_sink/` and
+`examples/redis_admission/`).
 
 ---
 
@@ -58,46 +57,11 @@ take effect when the matching extra is installed — `[sqlite]`, `[mssql]` or
 | `CONSUMER__DLQ_ENABLED` | `true` | DLQ master switch; `false` falls back to the legacy paused behavior (emergency escape hatch). |
 | `CONSUMER__DLQ_SEND_RETRIES` | `3` | Total attempts per DLQ send (exhausting them pauses the batch). |
 
-## DbConfig (`DB__*`)
-
-Needs extras: `[sqlite]` for `sqlite+aiosqlite://...` connection strings,
-`[mssql]` for SQL Server (`mssql+aioodbc://...`).
-
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `DB__CONNECTION_STRING` | **required when upserts / backfill are declared** | SQLAlchemy async connection string. Missing ⇒ assembly failure at engine creation with fix instructions (a pure Kafka pipeline never touches it). |
-| `DB__ECHO` | `false` | SQLAlchemy SQL echo. |
-| `DB__QUERY_TIMEOUT_SECONDS` | `5` | Driver statement timeout for existence backfill queries (must be ≤ `DB__QUERY_WAIT_SECONDS`). |
-| `DB__QUERY_WAIT_SECONDS` | `8` | Call-level `wait_for` around backfill queries. |
-| `DB__WRITE_TIMEOUT_SECONDS` | `20` | Driver statement timeout for batch writes (must be ≤ `DB__WRITE_WAIT_SECONDS`). |
-| `DB__WRITE_WAIT_SECONDS` | `25` | Call-level `wait_for` around batch writes. |
-| `DB__POOL_TIMEOUT_SECONDS` | `3` | Connection pool checkout timeout (fails fast when exhausted). |
-| `DB__COLD_PATH_MAX_CONCURRENCY` | `10` | Concurrency gate for cold-entity backfill (`<=0` disables). |
-| `DB__COLD_PATH_GATE_RETRY_AFTER_SECONDS` | `1` | Suggested retry interval when the gate is full. |
-| `DB__READ_POOL_SIZE` | `10` | Read pool size (ingest-side backfill). |
-| `DB__READ_POOL_MAX_OVERFLOW` | `10` | Read pool overflow. |
-| `DB__WRITE_POOL_SIZE` | `10` | Write pool size (consumer-side batch writes). |
-| `DB__WRITE_POOL_MAX_OVERFLOW` | `20` | Write pool overflow. |
-
-## RedisConfig (`REDIS__*`)
-
-Needs extra: `[redis]`. Only relevant when the `redis-existence` admission
-strategy (or its query endpoints) is used.
-
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `REDIS__URL` | `redis://localhost:6379/0` | Redis connection URL. |
-| `REDIS__KEY_PREFIX` | `streamgate:` | Prefix for existence keys. |
-| `REDIS__EXISTENCE_TTL_SECONDS` | `18000` | Existence entry TTL (5h; idle-GC via heartbeat renewal). |
-| `REDIS__EMPTY_EXISTENCE_TTL_SECONDS` | `3600` | Empty-entity sentinel TTL (shorter than existence TTL). |
-| `REDIS__SOCKET_TIMEOUT_MS` | `1000` | Query/validation path socket timeout. |
-| `REDIS__RECV_TIMEOUT_MS` | `500` | Reservation/summary write timeout on the ingest path. |
-| `REDIS__FAIL_CLOSED_ON_UNAVAILABLE` | `true` | Fail closed when Redis is unavailable (reject instead of silently degrading); `false` restores the legacy degraded behavior. |
-
 ## BackpressureConfig (`BACKPRESSURE__*`)
 
-The built-in HTTP probe signal needs extra: `[http-probe]`. Alternatively inject
-your own `BackpressureSignal` (no extra required).
+The gateway defaults to the built-in `ManualBackpressureSignal` (static
+switch). For dynamic probing inject your own `BackpressureSignal` — the
+HTTP-probe reference in `examples/http_probe/` reads this config object.
 
 | Env var | Default | Description |
 |---------|---------|-------------|

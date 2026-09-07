@@ -1,7 +1,7 @@
 """示例模型：ingress Schema（pydantic）与落库模型（SQLModel）。
 
 ingress Schema 归使用方（策略归使用方：entity/slot/summary 语义在此定义）；
-落库模型仅用于演示内置 Upsert sugar。
+落库模型与 Upsert 声明同为使用方策略（框架核心对此零感知）。
 """
 
 from pydantic import BaseModel

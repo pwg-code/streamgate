@@ -22,48 +22,112 @@ jobs:
         run: uv sync
       - name: Lint
         run: uv run ruff check .
-      - name: Import contracts (architectural layering)
+      - name: Import contracts (layering + pure-core forbidden modules)
         run: uv run lint-imports
       - name: Type check
         run: uv run pyright
       - name: Build distributions
         run: uv build
 
-  bare-install:
-    # Regression gate for the optional-extras contract: a bare install
-    # (no extras) must import cleanly and never touch redis/httpx/DB drivers.
+  examples:
+    # Examples are the storefront: they must meet the same quality bar as the
+    # package (lint + typecheck). Dev group carries the third-party libs the
+    # example modules import (sqlalchemy/sqlmodel/redis/httpx/aioodbc).
+    name: examples (lint + typecheck)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - name: Bare install (no extras)
+      - name: Install project and dev tools
+        run: uv sync
+      - name: Lint examples
+        run: uv run ruff check examples
+      - name: Type check examples
+        run: uv run pyright examples
+
+  bare-install:
+    # Regression gate for the pure-core contract: a bare install
+    # (`pip install .`) must pull exactly aiokafka/loguru/pydantic (+transitive),
+    # import cleanly, and run the pure_pipeline example end to end
+    # (ingest → Kafka → consume → sqlite sink) against a real broker.
+    runs-on: ubuntu-latest
+    services:
+      kafka:
+        image: apache/kafka:3.9.0
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        ports:
+          - 29092:29092
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Bare install (no extras — the extras concept no longer exists)
         run: |
           uv venv bare
           uv pip install --python bare/bin/python .
-      - name: "Smoke: bare import, extras gating, required connection string"
+      - name: "Smoke: dependency tree is pure (no DB/redis/httpx carriers)"
+        run: |
+          bare/bin/python -m pip list --format=freeze > deps.txt
+          cat deps.txt
+          for pkg in sqlalchemy sqlmodel redis aiosqlite aioodbc httpx; do
+            if grep -qi "^${pkg}==" deps.txt; then
+              echo "pure-core violation: ${pkg} leaked into bare install"; exit 1
+            fi
+          done
+      - name: "Smoke: bare import + core contracts"
         run: |
           bare/bin/python - <<'EOF'
           import streamgate
 
           assert streamgate.__version__
 
-          for symbol, extra in (
-              ("RedisExistenceCache", "streamgate[redis]"),
-              ("HttpProbeSignal", "streamgate[http-probe]"),
-          ):
-              try:
-                  getattr(streamgate, symbol)
-              except ImportError as e:
-                  assert extra in str(e), f"guidance missing for {symbol}: {e}"
-              else:
-                  raise AssertionError(f"{symbol} should be gated on bare install")
-
-          from streamgate import DbConfig, IngestBinding, IngestGateway
+          from streamgate import (
+              ConsumeSpec, DefaultErrorClassifier, ErrorKind,
+              InMemoryAdmission, IngestBinding, IngestGateway,
+              ManualBackpressureSignal,
+          )
 
           try:
-              DbConfig().require_connection_string()
+              ConsumeSpec()
           except ValueError as e:
-              assert "DB__CONNECTION_STRING" in str(e)
+              assert "sink" in str(e) and "on_record" in str(e)
 
-          print("bare-install smoke OK")
+          print("bare-install import smoke OK")
+          EOF
+      - name: "Smoke: pure_pipeline end to end (produce → Kafka → consume → sqlite)"
+        working-directory: examples/pure_pipeline
+        run: |
+          KAFKA__BOOTSTRAP_SERVERS=localhost:29092 ../../../bare/bin/python consume.py &
+          CONSUMER_PID=$!
+          sleep 15
+          KAFKA__BOOTSTRAP_SERVERS=localhost:29092 ../../../bare/bin/python produce.py | tee produce.out
+          grep -q "o-1: accepted" produce.out
+          grep -q "o-1: conflict" produce.out   # in-memory uniqueness contract
+          grep -q "o-2: accepted" produce.out
+          sleep 20   # allow batch-timeout flush + offset commit
+          kill -INT $CONSUMER_PID
+          wait $CONSUMER_PID
+          ../../../bare/bin/python - <<'EOF'
+          import sqlite3
+
+          con = sqlite3.connect("data/pipeline.db")
+          (count,) = con.execute("select count(*) from orders").fetchone()
+          assert count == 2, f"expected 2 orders in sqlite sink, got {count}"
+          print(f"pure_pipeline smoke OK: {count} orders landed in sqlite (o-1 deduplicated)")
           EOF

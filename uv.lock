@@ -773,66 +773,39 @@ dependencies = [
     { name = "aiokafka" },
     { name = "loguru" },
     { name = "pydantic" },
-    { name = "sqlalchemy" },
-    { name = "sqlmodel" },
-]
-
-[package.optional-dependencies]
-all = [
-    { name = "aioodbc" },
-    { name = "aiosqlite" },
-    { name = "httpx" },
-    { name = "redis" },
-]
-http-probe = [
-    { name = "httpx" },
-]
-mssql = [
-    { name = "aioodbc" },
-]
-redis = [
-    { name = "redis" },
-]
-sqlite = [
-    { name = "aiosqlite" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "aioodbc" },
     { name = "aiosqlite" },
     { name = "httpx" },
     { name = "import-linter" },
     { name = "pyright" },
     { name = "redis" },
     { name = "ruff" },
+    { name = "sqlalchemy" },
+    { name = "sqlmodel" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "aiokafka", specifier = ">=0.10" },
-    { name = "aioodbc", marker = "extra == 'all'", specifier = ">=0.5" },
-    { name = "aioodbc", marker = "extra == 'mssql'", specifier = ">=0.5" },
-    { name = "aiosqlite", marker = "extra == 'all'", specifier = ">=0.19" },
-    { name = "aiosqlite", marker = "extra == 'sqlite'", specifier = ">=0.19" },
-    { name = "httpx", marker = "extra == 'all'", specifier = ">=0.27" },
-    { name = "httpx", marker = "extra == 'http-probe'", specifier = ">=0.27" },
     { name = "loguru", specifier = ">=0.7" },
     { name = "pydantic", specifier = ">=2.5" },
-    { name = "redis", marker = "extra == 'all'", specifier = ">=5" },
-    { name = "redis", marker = "extra == 'redis'", specifier = ">=5" },
-    { name = "sqlalchemy", specifier = ">=2.0" },
-    { name = "sqlmodel", specifier = ">=0.0.16" },
 ]
-provides-extras = ["all", "http-probe", "mssql", "redis", "sqlite"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "aioodbc", specifier = ">=0.5" },
     { name = "aiosqlite", specifier = ">=0.19" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "import-linter", specifier = ">=2.0" },
     { name = "pyright", specifier = ">=1.1.380" },
     { name = "redis", specifier = ">=5" },
     { name = "ruff", specifier = ">=0.6" },
+    { name = "sqlalchemy", specifier = ">=2.0" },
+    { name = "sqlmodel", specifier = ">=0.0.16" },
 ]
 
 [[package]]

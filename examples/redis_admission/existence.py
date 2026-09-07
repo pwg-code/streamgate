@@ -6,18 +6,15 @@
 - 空实体哨兵：仅 key 不存在时写入（防与占位竞态）
 - fail-closed 与否是准入策略的参数，缓存层只如实报告错误
 """
-
 import asyncio
 import json
-from typing import TYPE_CHECKING, TypeVar
+from collections.abc import Awaitable
+from typing import TypeVar
 
-from streamgate._optional import require_optional
-from streamgate.config import RedisConfig
-from streamgate.obs.logging import logger
+import redis.asyncio as aioredis
+from settings import RedisConfig
 
-if TYPE_CHECKING:
-    # redis 是 extras 依赖（streamgate[redis]）：仅类型检查可见，运行时惰性装载
-    import redis.asyncio as aioredis
+from streamgate import logger
 
 _T = TypeVar("_T")
 
@@ -62,7 +59,7 @@ return 0
 """
 
 
-def parse_summary(raw: str) -> dict:
+def parse_summary(raw: str) -> dict[str, object]:
     """解析 field value；损坏数据不致命（返回空摘要，宁可多报 409）。"""
     try:
         parsed = json.loads(raw)
@@ -80,11 +77,11 @@ def dumps_summary(summary: dict[str, object]) -> str:
 
 class RedisExistenceCache:
     def __init__(
-        self, config: RedisConfig, client: "aioredis.Redis | None" = None
+        self, config: RedisConfig, client: aioredis.Redis | None = None
     ) -> None:
         self._config = config
         self._injected = client
-        self._client: "aioredis.Redis | None" = None
+        self._client: aioredis.Redis | None = None
 
     @property
     def existence_ttl_seconds(self) -> int:
@@ -96,10 +93,6 @@ class RedisExistenceCache:
         if self._injected is not None:
             self._client = self._injected
             return
-        # redis 为 extras 依赖：仅在此真正建连时装载（缺失抛带指引的 ImportError）
-        require_optional("redis.asyncio")
-        import redis.asyncio as aioredis
-
         self._client = aioredis.from_url(
             self._config.url,
             socket_timeout=self._config.socket_timeout_ms / 1000,
@@ -136,16 +129,16 @@ class RedisExistenceCache:
 
     # ---------- 内部工具 ----------
 
-    def _require_client(self) -> "aioredis.Redis":
+    def _require_client(self) -> aioredis.Redis:
         if self._client is None:
             raise RuntimeError("RedisExistenceCache not started, call start() first")
         return self._client
 
-    async def _read(self, coro):
+    async def _read(self, coro: Awaitable[_T]) -> _T:
         """读操作统一超时（查询路径 socket_timeout_ms）。"""
         return await asyncio.wait_for(coro, timeout=self._config.socket_timeout_ms / 1000)
 
-    async def _write(self, coro):
+    async def _write(self, coro: Awaitable[_T]) -> _T:
         """写操作统一超时（接收路径 recv_timeout_ms）。"""
         return await asyncio.wait_for(coro, timeout=self._config.recv_timeout_ms / 1000)
 
@@ -155,7 +148,7 @@ class RedisExistenceCache:
         raw = await self._read(self._require_client().hget(self.existence_key(entity), slot))
         if raw is None:
             return None
-        return parse_summary(raw)
+        return parse_summary(str(raw))
 
     async def key_exists(self, entity: str) -> bool:
         return bool(await self._read(self._require_client().exists(self.existence_key(entity))))
@@ -163,7 +156,7 @@ class RedisExistenceCache:
     async def get_entity_fields(self, entity: str) -> dict[str, dict[str, object]] | None:
         raw: dict[str, str] = await self._read(
             self._require_client().hgetall(self.existence_key(entity))
-        )
+        )  # type: ignore[assignment]
         if not raw:
             return None  # Redis 中不存在只有 0 个 field 的 HASH，空 dict 即 key 不存在
         return {
@@ -186,7 +179,7 @@ class RedisExistenceCache:
                 args=[slot, dumps_summary(summary), self._config.existence_ttl_seconds, EMPTY_FIELD],
             )
         )
-        reserved, existing = int(result[0]), result[1]
+        reserved, existing = int(result[0]), result[1]  # type: ignore[index]
         if reserved == 1:
             return (True, None)
         return (False, parse_summary(str(existing)))
@@ -227,7 +220,7 @@ class RedisExistenceCache:
                 args=[self._config.empty_existence_ttl_seconds, EMPTY_FIELD],
             )
         )
-        return int(created) == 1
+        return int(created) == 1  # type: ignore[arg-type]
 
     async def delete_entity(self, entity: str) -> None:
         await self._write(self._require_client().delete(self.existence_key(entity)))

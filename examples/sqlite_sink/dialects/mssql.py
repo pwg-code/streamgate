@@ -28,7 +28,7 @@ SAFE_PARAM_BUDGET = 2000
 def mssql_cast_types(model: type[SQLModel]) -> dict[str, str]:
     """按表元数据生成各属性的 MSSQL CAST 目标类型（键为 Python 属性名）。
 
-    应对 B4：VALUES 行构造器中某列全为 NULL 参数时，类型推导可能给出与
+    VALUES 行构造器中某列全为 NULL 参数时，类型推导可能给出与
     目标列不匹配的类型，显式 CAST 固定每列类型。字符串列统一 NVARCHAR(max)：
     驱动（aioodbc/pyodbc）本就按 Unicode 声明字符串参数，与既有单行 MERGE
     的比较语义一致，且规避 CAST 到 VARCHAR 时按库默认排序规则代码页转换

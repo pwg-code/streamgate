@@ -1,4 +1,4 @@
-"""RedisExistenceAdmission：唯一性准入的参考实现。
+"""RedisExistenceAdmission：唯一性准入的参考实现（原 ingest/admission 平移）。
 
 协议适配层：entity+slot 原子占位（Lua）、idle-GC TTL、
 空实体哨兵、fail-closed、overwrite 预检；TTL/前缀/降级开关/错误码全参数化。
@@ -13,9 +13,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Generic
 
-from streamgate.cache.existence import RedisExistenceCache
-from streamgate.config import RedisConfig
-from streamgate.obs.logging import logger
+from existence import RedisExistenceCache
+from redis.exceptions import RedisError
+from settings import RedisConfig
+
+from streamgate import logger
 from streamgate.protocols import (
     BackfillSource,
     Decision,
@@ -26,18 +28,11 @@ from streamgate.protocols import (
     RejectInfo,
 )
 
-try:
-    # redis 是 extras 依赖（streamgate[redis]）：未安装时 RedisError 不可能被抛出，
-    # 错误元组退化为其余两项即可（行为零变更）
-    from redis.exceptions import RedisError
-
-    _REDIS_ERRORS: tuple[type[Exception], ...] = (
-        RedisError,
-        asyncio.TimeoutError,
-        OSError,
-    )
-except ImportError:  # pragma: no cover - 仅裸装（无 redis extras）时生效
-    _REDIS_ERRORS = (asyncio.TimeoutError, OSError)
+_REDIS_ERRORS: tuple[type[Exception], ...] = (
+    RedisError,
+    asyncio.TimeoutError,
+    OSError,
+)
 
 _UNDETERMINED_LOG_EVENT = "existence_undetermined"
 
@@ -98,7 +93,10 @@ class RedisExistenceAdmissionConfig:
 
 
 class RedisExistenceAdmission(Generic[RecordT]):
-    """存在性判定 + 原子占位编排（接收路径）与整实体 slot 查询。"""
+    """存在性判定 + 原子占位编排（接收路径）与整实体 slot 查询。
+
+    作为 AdmissionPolicy 协议实例注入 IngestBinding(admission=...)。
+    """
 
     def __init__(
         self,
@@ -195,7 +193,7 @@ class RedisExistenceAdmission(Generic[RecordT]):
 
         result = await self._check_and_reserve(entity, slot, self._summary(record))
         if result is None:
-            # NOT_EXISTS：占位已生效（或 E3 降级无占位，仅配置关闭时），继续
+            # NOT_EXISTS：占位已生效（或降级无占位，仅配置关闭时），继续
             return Decision.allow()
         return result
 
@@ -218,7 +216,7 @@ class RedisExistenceAdmission(Generic[RecordT]):
         return False
 
     async def on_persisted(self, record: RecordT) -> None:
-        """落库成功 → 提交 offset 前的权威缓存刷新（E5：失败 WARN 不影响提交）。"""
+        """落库成功 → 提交 offset 前的权威缓存刷新（失败 WARN 不影响提交）。"""
         entity = str(self._entity_key(record))
         slot = str(self._slot_key(record))
         if not entity or not slot:
@@ -301,7 +299,7 @@ class RedisExistenceAdmission(Generic[RecordT]):
         except _REDIS_ERRORS as e:
             if self._config.fail_closed_on_unavailable:
                 return self._reject_redis_unavailable(error=str(e))
-            # E3：占位失败 -> 无占位继续（ERROR 告警，删 key 修复）；仅配置关闭时可达
+            # 占位失败 -> 无占位继续（ERROR 告警，删 key 修复）；仅配置关闭时可达
             logger.error(
                 "reserve_failed_degraded",
                 **self._context(entity, slot),

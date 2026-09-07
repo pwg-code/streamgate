@@ -20,9 +20,8 @@ from datetime import datetime, timezone
 from aiokafka import AIOKafkaProducer
 
 from streamgate.config import KafkaConfig
-from streamgate.consumer.classifier import FailureCategory
 from streamgate.obs.logging import logger
-from streamgate.protocols import JsonObject, RecordWriter
+from streamgate.protocols import ErrorKind, JsonObject, RecordWriter
 
 DLQ_SEND_RETRY_INTERVAL_SECONDS = 1.0  # 发送尝试间隔（隔离路径不在吞吐热区，固定值即可）
 
@@ -245,7 +244,7 @@ def _original_message(raw_value: str | None) -> JsonObject:
 
 def _build_quarantine_request(
     message: BufferedMessage,
-    category: FailureCategory,
+    category: ErrorKind,
     error: str,
 ) -> QuarantineRequest:
     return QuarantineRequest(
@@ -280,20 +279,20 @@ async def _isolate_single(
     dlq: DlqProducer,
     bad: BufferedMessage,
     probe_pool: list[BufferedMessage],
-    category: FailureCategory,
+    category: ErrorKind,
     outcome: BisectOutcome,
     write_error: str,
 ) -> None:
-    """单条失败：探针对照后隔离（探针失败 ⟹ 疑似 DB 故障，中止全局）。
+    """单条失败：探针对照后隔离（探针失败 ⟹ 疑似存储故障，中止全局）。
 
-    原批只有 1 条、无同批对照：若分类已明确是数据问题（DATA，
-    classify_write_failure 已排除连接/超时/死锁/池耗尽等基础设施类），
-    可直接隔离——否则单条坏数据将陷入 paused→重试→paused 死循环。
-    UNKNOWN 无法断定 DB 健康，仍按不变式 2 转 paused（探针保护）。
+    原批只有 1 条、无同批对照：若分类器已明确判定 POISON（排除了
+    超时/连接等瞬态类），可直接隔离——否则单条坏数据将陷入
+    paused→重试→paused 死循环。非 POISON 分类无法断定存储健康，
+    仍按不变式转 paused（探针保护）。
     """
     probe = _pick_probe(probe_pool, bad, outcome.written)
     if probe is None:
-        if category is FailureCategory.DATA:
+        if category is ErrorKind.POISON:
             request = _build_quarantine_request(bad, category, write_error)
             await dlq.quarantine(request)
             outcome.quarantined.append(QuarantinedRecord(message=bad, request=request))
@@ -319,14 +318,14 @@ async def _locate(
     dlq: DlqProducer,
     records: list[BufferedMessage],
     probe_pool: list[BufferedMessage],
-    category: FailureCategory,
+    category: ErrorKind,
     outcome: BisectOutcome,
 ) -> None:
     """递归定位写入一段记录。
 
     成功：写入并记入 outcome.written；
     失败：二分前半/后半；单条失败用探针对照后隔离。
-    抛 _BisectAborted（疑似 DB 故障，中止全局）或 DlqSendError（DLQ 不可用）。
+    抛 _BisectAborted（疑似存储故障，中止全局）或 DlqSendError（DLQ 不可用）。
 
     定位写入刻意"1 次尝试不重试"：瞬时抖动由探针
     对照兜底区分，不做退避重试。
@@ -354,7 +353,7 @@ async def locate_and_write(
     writer: RecordWriter,
     dlq: DlqProducer,
     batch: list[BufferedMessage],
-    category: FailureCategory,
+    category: ErrorKind,
     error: str,
 ) -> BisectOutcome | None:
     """二分定位入口。返回值/异常语义见接口契约；error 为触发定位的原始批级错误，

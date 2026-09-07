@@ -152,7 +152,7 @@ class NoBackfill:
 
 @dataclass(frozen=True)
 class WriteResult:
-    """write 全成时的计数（按 Upsert.name 汇总）；失败以异常表达。"""
+    """write 全成时的计数（键为写入目标名，由实现自定义）；失败以异常表达。"""
 
     counts: dict[str, int] = field(default_factory=dict)
 
@@ -171,6 +171,38 @@ class RecordWriter(Protocol):
     async def close(self) -> None:
         """释放写侧资源（幂等；停机时由消费运行器调用）。"""
         ...
+
+
+# ---- 写入失败分类（消费端异常处置的决策输入）----
+
+class ErrorKind(str, Enum):
+    """写侧异常的处置路径分类：
+
+    - RETRY：瞬态错误（超时/连接抖动/限流）→ 退避重试当前批次
+    - POISON：毒消息（内容本身无法落地）→ DLQ 二分隔离
+    - FATAL：致命错误（框架级不可恢复）→ 停机告警
+    """
+
+    RETRY = "retry"
+    POISON = "poison"
+    FATAL = "fatal"
+
+
+@runtime_checkable
+class ErrorClassifier(Protocol):
+    """写侧异常分类器（ConsumerWorker 注入点）。
+
+    实现必须是纯函数式判定（不产生 I/O、不抛异常）：
+    返回 ErrorKind 决定框架对该批失败的处置路径。
+    attempt 为当前批次已重试次数（从 0 起），供实现做次数升级策略
+    （如"同一异常重试 N 次后升级为 FATAL"），默认实现不使用该参数。
+
+    未注入时框架使用 DefaultErrorClassifier（只认通用异常，
+    不认识任何 DB/中间件专有类型；接 DB 的使用方应注入对应分类器，
+    参考实现见 examples/sqlite_sink/）。
+    """
+
+    def classify(self, exc: Exception, attempt: int) -> ErrorKind: ...
 
 
 # ---- 背压信号（拓扑无关）----
@@ -342,6 +374,8 @@ __all__ = [
     "Decision",
     "DecisionKind",
     "Envelope",
+    "ErrorClassifier",
+    "ErrorKind",
     "IngestOutcome",
     "JsonObject",
     "MessageCodec",

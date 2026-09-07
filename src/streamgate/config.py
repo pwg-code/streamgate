@@ -1,8 +1,8 @@
 """streamgate 组件配置对象（每组件独立，Spec 内可覆写）。
 
-配置键名与既有环境变量逐字对应
-（KAFKA__* / CONSUMER__* / DB__* / REDIS__* / BACKPRESSURE__*），
-调用方零配置迁移。
+配置键名与既有环境变量逐字对应（KAFKA__* / CONSUMER__* / BACKPRESSURE__*），
+调用方零配置迁移。DB/Redis 是使用方的世界：连接配置由使用方/示例自带
+（不进框架核心）。
 """
 
 from pydantic import BaseModel, field_validator
@@ -63,69 +63,6 @@ class KafkaConfig(BaseModel):
                     break
             cleaned.append(part)
         return ",".join(cleaned)
-
-
-class DbConfig(BaseModel):
-    # 必填：声明 upserts/SqlBackfill 时在引擎创建单点校验
-    # （缺失即装配失败，不做项目专属默认；纯 Kafka 管道无需配置）。
-    # 驱动按连接串动态加载：sqlite 需 extras [sqlite]，mssql 需 extras [mssql]。
-    connection_string: str | None = None
-    echo: bool = False
-    # --- L1 快速失败边界（异步落库链路加固）---
-    query_timeout_seconds: int = 5      # existence 回源驱动语句超时（MSSQL；须 <= query_wait_seconds）
-    query_wait_seconds: int = 8         # existence 回源调用层 wait_for
-    write_timeout_seconds: int = 20     # write_batch 驱动语句超时（MSSQL；须 <= write_wait_seconds）
-    write_wait_seconds: int = 25        # write_batch 调用层 wait_for
-    pool_timeout_seconds: int = 3       # 连接池获取超时（池耗尽快速失败）
-    cold_path_max_concurrency: int = 10  # 冷实体回源并发闸门（<=0 禁用；与读池宽度一致留余量）
-    cold_path_gate_retry_after_seconds: int = 1  # 闸门满时建议调用方的重试间隔（秒）
-    # 读连接池（ingest 进程 existence 回源专用）：闸门默认 10，池总容量 20 留余量，
-    # 避免 check_health 等非回源占用与回源争抢触发 pool_timeout 快速失败。
-    read_pool_size: int = 10            # 读池固定连接数
-    read_pool_max_overflow: int = 10    # 读池溢出连接数（峰值余量）
-    # 写连接池（consumer 进程 write_batch 专用）：默认值即原硬编码值（零行为变更）
-    write_pool_size: int = 10           # 写池固定连接数
-    write_pool_max_overflow: int = 20   # 写池溢出连接数
-
-    def require_connection_string(self) -> str:
-        """连接串装配校验（引擎创建单点调用）：None 即配置错误，含修复指引。"""
-        if self.connection_string is None:
-            raise ValueError(
-                "db connection string is required when upserts or SqlBackfill are "
-                "declared: set DbConfig.connection_string (env: DB__CONNECTION_STRING), "
-                "e.g. 'sqlite+aiosqlite:///./data/streamgate.db'"
-            )
-        return self.connection_string
-
-    @property
-    def dialect(self) -> str:
-        """驱动方言标签（日志/分支用）：sqlite | mssql。"""
-        return "sqlite" if "sqlite" in self.require_connection_string().lower() else "mssql"
-
-    @property
-    def redacted_connection_string(self) -> str:
-        """隐藏密码后的连接串（日志用，避免凭据入日志）。"""
-        s = self.require_connection_string()
-        if "://" not in s or "@" not in s:
-            return s
-        scheme, _, rest = s.partition("://")
-        userinfo, _, host = rest.rpartition("@")
-        if ":" in userinfo:
-            user, _, _ = userinfo.partition(":")
-            userinfo = f"{user}:***"
-        return f"{scheme}://{userinfo}@{host}"
-
-
-class RedisConfig(BaseModel):
-    url: str = "redis://localhost:6379/0"
-    key_prefix: str = "streamgate:"
-    existence_ttl_seconds: int = 18000       # existence TTL 5h
-    empty_existence_ttl_seconds: int = 3600  # 空实体哨兵 TTL（短于 existence TTL）
-    socket_timeout_ms: int = 1000      # 查询/校验路径超时
-    recv_timeout_ms: int = 500         # 接收路径占位/摘要写超时
-    # ingest 自身 Redis 不可用时 fail-closed：校验路径/overwrite 路径/位置查询端点
-    # 全部返回错误而非静默降级（杜绝无占位接受与不完整查询结果）；false=旧降级逃生门
-    fail_closed_on_unavailable: bool = True
 
 
 class BackpressureConfig(BaseModel):

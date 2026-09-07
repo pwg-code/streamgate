@@ -1,4 +1,8 @@
-"""回源实现：NoBackfill / SqlBackfill（BackfillSource 协议的内置实现）。"""
+"""SQL 回源实现（原 streamgate.db.backfill.SqlBackfill 平移）。
+
+BackfillSource 协议的 SQL 参考：冷实体整实体加载 slot→summary，
+供 RedisExistenceAdmission 注入（见 examples/redis_admission/）。
+"""
 
 import asyncio
 from datetime import datetime
@@ -6,7 +10,7 @@ from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from streamgate.obs.logging import logger
+from streamgate import logger
 from streamgate.protocols import JsonObject
 
 

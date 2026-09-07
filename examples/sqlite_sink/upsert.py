@@ -1,26 +1,73 @@
-"""幂等 upsert 编排（唯一写原语）：方言分发 + 单事务批量执行。
+"""Upsert 声明 + 幂等 upsert 编排（原 streamgate Upsert sugar 平移）。
 
-模型无关化：模型/键/字段全部来自
-specs.Upsert 声明，行级拆分/清洗等使用方策略经 prepare 钩子注入。
+原核心的 `Upsert`（specs.py）与 `UpsertWriter`（db/upsert.py）合并为本模块，
+作为 RecordWriter 协议的参考实现演示注入用法。
 """
 
 import asyncio
+from collections.abc import Callable
 
+from config import DbConfig
+from dialects import mssql as mssql_dialect
+from dialects import sqlite as sqlite_dialect
+from dialects.mssql import mssql_cast_types
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlmodel import SQLModel
 
-from streamgate.config import DbConfig
-from streamgate.db.dialects import mssql as mssql_dialect
-from streamgate.db.dialects import sqlite as sqlite_dialect
-from streamgate.obs.logging import logger
+from streamgate import logger
 from streamgate.protocols import JsonObject, WriteResult
-from streamgate.specs import Upsert
+
+# 行级变换钩子类型（Upsert.prepare 参数）
+RowTransform = Callable[[JsonObject], JsonObject]
 
 
-def _create_tables(sync_conn) -> None:
+class Upsert:
+    """一个落库目标：模型 + 幂等键（+ 可选字段排除/行级变换）。
+
+    name 用于写入计数与 batch_write_success 日志字段（f"{name}_count"）；
+    prepare 为行级策略钩子（如时区归一、字段清洗），在字段投影前执行；
+    exclude 为不参与 INSERT/UPDATE 的列（如 IDENTITY 自增主键）。
+    """
+
+    def __init__(
+        self,
+        model: type[SQLModel],
+        keys: list[str],
+        name: str = "",
+        exclude: tuple[str, ...] = (),
+        prepare: RowTransform | None = None,
+    ) -> None:
+        self.model = model
+        self.keys = keys
+        self.name = name
+        self.exclude = exclude
+        self.prepare = prepare
+        if not self.keys:
+            raise ValueError("Upsert.keys must not be empty")
+        mapper = sa_inspect(self.model)
+        self.fields: list[str] = [
+            prop.key
+            for prop in mapper.column_attrs
+            if prop.key not in self.exclude
+        ]
+        missing = [k for k in self.keys if k not in self.fields]
+        if missing:
+            raise ValueError(f"Upsert keys not in model fields: {missing}")
+        # 属性名 → DB 列名（保留模型元数据中的原始列名，含大小写/特殊字符）
+        self.column_names: dict[str, str] = {
+            prop.key: prop.columns[0].name
+            for prop in mapper.column_attrs
+        }
+        self.cast_types: dict[str, str] = mssql_cast_types(self.model)
+        if not self.name:
+            self.name = str(self.model.__tablename__).lower()
+
+
+def _create_tables(sync_conn: object) -> None:
     """SQLModel.metadata.create_all 的同步回调。"""
-    SQLModel.metadata.create_all(sync_conn)
+    SQLModel.metadata.create_all(sync_conn)  # type: ignore[reportAttributeAccessIssue]
 
 
 def _project_rows(spec: Upsert, records: list[JsonObject]) -> list[JsonObject]:
@@ -95,7 +142,7 @@ async def execute_upserts(
 
 
 class UpsertWriter:
-    """RecordWriter 默认实现：幂等 upsert 编排（含启动建表/健康探测/关闭）。"""
+    """RecordWriter 参考实现：幂等 upsert 编排（含启动建表/健康探测/关闭）。"""
 
     def __init__(
         self,
@@ -203,3 +250,6 @@ class UpsertWriter:
                     session, self._upserts, batch, is_sqlite=self._config.dialect == "sqlite"
                 )
         return counts
+
+
+__all__ = ["Upsert", "UpsertWriter", "execute_upserts"]
