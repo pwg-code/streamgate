@@ -1,0 +1,41 @@
+name: Release
+
+# Publishes to PyPI via Trusted Publisher (OIDC) — no API token stored in the repo.
+#
+# One-time manual setup (outside this repository):
+#   1. Create the PyPI project "streamgate" owner account with 2FA enabled.
+#   2. On PyPI: project -> Publishing -> add a "GitHub" Trusted Publisher:
+#        owner / repository = <owner>/streamgate
+#        workflow filename  = release.yml
+#        environment name   = pypi
+#      (create the protected GitHub environment "pypi" on the repo as well)
+#   3. Rehearse on TestPyPI first by adding an equivalent Trusted Publisher
+#      for testpypi and temporarily retargeting the publish step below.
+#
+# Before tagging, ensure src/streamgate/__init__.py __version__ and CHANGELOG.md
+# both mention the version being released (workflow fails fast on mismatch).
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Verify tag matches package version
+        run: |
+          PKG_VERSION="$(grep -oP '(?<=__version__ = ")[^"]+' src/streamgate/__init__.py)"
+          if [ "v${PKG_VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match package version v${PKG_VERSION}"
+            exit 1
+          fi
+      - name: Build distributions
+        run: uv build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

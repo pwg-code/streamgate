@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    name: checks (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install project and dev tools
+        run: uv sync
+      - name: Lint
+        run: uv run ruff check .
+      - name: Import contracts (architectural layering)
+        run: uv run lint-imports
+      - name: Type check
+        run: uv run pyright
+      - name: Build distributions
+        run: uv build
+
+  bare-install:
+    # Regression gate for the optional-extras contract: a bare install
+    # (no extras) must import cleanly and never touch redis/httpx/DB drivers.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Bare install (no extras)
+        run: |
+          uv venv bare
+          uv pip install --python bare/bin/python .
+      - name: Smoke: bare import, extras gating, required connection string
+        run: |
+          bare/bin/python - <<'EOF'
+          import streamgate
+
+          assert streamgate.__version__
+
+          for symbol, extra in (
+              ("RedisExistenceCache", "streamgate[redis]"),
+              ("HttpProbeSignal", "streamgate[http-probe]"),
+          ):
+              try:
+                  getattr(streamgate, symbol)
+              except ImportError as e:
+                  assert extra in str(e), f"guidance missing for {symbol}: {e}"
+              else:
+                  raise AssertionError(f"{symbol} should be gated on bare install")
+
+          from streamgate import DbConfig, IngestBinding, IngestGateway
+
+          try:
+              DbConfig().require_connection_string()
+          except ValueError as e:
+              assert "DB__CONNECTION_STRING" in str(e)
+
+          print("bare-install smoke OK")
+          EOF
