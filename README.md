@@ -2,8 +2,8 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/streamgate.svg)](https://pypi.org/project/streamgate/)
 [![Python versions](https://img.shields.io/pypi/pyversions/streamgate.svg)](https://pypi.org/project/streamgate/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/{github_owner}/streamgate/blob/main/LICENSE)
-[![CI](https://github.com/{github_owner}/streamgate/actions/workflows/ci.yml/badge.svg)](https://github.com/{github_owner}/streamgate/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/pwg-code/streamgate/blob/main/LICENSE)
+[![CI](https://github.com/pwg-code/streamgate/actions/workflows/ci.yml/badge.svg)](https://github.com/pwg-code/streamgate/actions/workflows/ci.yml)
 
 **streamgate** is a Kafka-backed data pipeline framework: conditional admission at the door, reliable delivery through Kafka, and idempotent sinking wherever you want the data to land.
 

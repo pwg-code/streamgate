@@ -56,9 +56,9 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/{github_owner}/streamgate"
-Repository = "https://github.com/{github_owner}/streamgate"
-Changelog = "https://github.com/{github_owner}/streamgate/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/pwg-code/streamgate"
+Repository = "https://github.com/pwg-code/streamgate"
+Changelog = "https://github.com/pwg-code/streamgate/blob/main/CHANGELOG.md"
 
 [tool.hatch.version]
 path = "src/streamgate/__init__.py"

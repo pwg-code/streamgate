@@ -31,4 +31,4 @@ First public release. Data pipeline framework: conditional admission → reliabl
   - Mechanisms as core dependencies; all policy carriers (DB drivers, redis, httpx) as optional extras with lazy loading and install-guidance errors.
   - Typed configuration objects mapping 1:1 to `KAFKA__*` / `CONSUMER__*` / `DB__*` / `REDIS__*` / `BACKPRESSURE__*` environment variables; required settings fail fast at startup.
 
-[0.1.0]: https://github.com/{github_owner}/streamgate/releases/tag/v0.1.0
+[0.1.0]: https://github.com/pwg-code/streamgate/releases/tag/v0.1.0

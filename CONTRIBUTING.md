@@ -7,7 +7,7 @@ Thanks for your interest in contributing to streamgate!
 This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
 
 ```bash
-git clone https://github.com/{github_owner}/streamgate
+git clone https://github.com/pwg-code/streamgate
 cd streamgate
 uv sync            # creates .venv and installs the project (editable) + dev tools
 ```
