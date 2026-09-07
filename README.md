@@ -5,6 +5,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/pwg-code/streamgate/blob/main/LICENSE)
 [![CI](https://github.com/pwg-code/streamgate/actions/workflows/ci.yml/badge.svg)](https://github.com/pwg-code/streamgate/actions/workflows/ci.yml)
 
+English | [中文](README.zh-CN.md)
+
 **streamgate** is a pure-core Kafka data pipeline framework: conditional admission at the door, reliable delivery through Kafka, and a single typed hook — `RecordWriter` — wherever you want the data to land.
 
 The wheel installs exactly three dependencies (`aiokafka`, `loguru`, `pydantic`) and contains **zero database, Redis or HTTP-client code**. All I/O strategies ship as copy-paste examples in [`examples/`](examples/).
