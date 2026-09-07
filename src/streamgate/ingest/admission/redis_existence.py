@@ -13,8 +13,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Generic
 
-from redis.exceptions import RedisError
-
 from streamgate.cache.existence import RedisExistenceCache
 from streamgate.config import RedisConfig
 from streamgate.obs.logging import logger
@@ -28,7 +26,18 @@ from streamgate.protocols import (
     RejectInfo,
 )
 
-_REDIS_ERRORS = (RedisError, asyncio.TimeoutError, OSError)
+try:
+    # redis 是 extras 依赖（streamgate[redis]）：未安装时 RedisError 不可能被抛出，
+    # 错误元组退化为其余两项即可（行为零变更）
+    from redis.exceptions import RedisError
+
+    _REDIS_ERRORS: tuple[type[Exception], ...] = (
+        RedisError,
+        asyncio.TimeoutError,
+        OSError,
+    )
+except ImportError:  # pragma: no cover - 仅裸装（无 redis extras）时生效
+    _REDIS_ERRORS = (asyncio.TimeoutError, OSError)
 
 _UNDETERMINED_LOG_EVENT = "existence_undetermined"
 

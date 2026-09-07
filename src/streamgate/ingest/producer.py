@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 
 from aiokafka import AIOKafkaProducer
-from aiokafka.errors import KafkaError, KafkaConnectionError
+from aiokafka.errors import KafkaConnectionError, KafkaError
 
 from streamgate.config import KafkaConfig
 from streamgate.obs.logging import logger

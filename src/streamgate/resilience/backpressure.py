@@ -20,12 +20,16 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import TYPE_CHECKING
 
-import httpx
-
+from streamgate._optional import require_optional
 from streamgate.config import BackpressureConfig
 from streamgate.obs.logging import logger
 from streamgate.protocols import BackpressureSnapshot, ProbeResult
+
+if TYPE_CHECKING:
+    # httpx 是 extras 依赖（streamgate[http-probe]）：仅类型检查可见，运行时惰性装载
+    import httpx
 
 
 class _HysteresisController:
@@ -299,6 +303,10 @@ class HttpProbeSignal(_HysteresisController):
 
     async def _probe_start(self) -> None:
         if self._client is None:
+            # httpx 为 extras 依赖：仅在此真正建连时装载（缺失抛带指引的 ImportError）
+            require_optional("httpx")
+            import httpx
+
             self._client = httpx.AsyncClient(timeout=self._config.timeout_seconds)
 
     async def _probe_close(self) -> None:

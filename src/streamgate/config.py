@@ -66,7 +66,10 @@ class KafkaConfig(BaseModel):
 
 
 class DbConfig(BaseModel):
-    connection_string: str = "sqlite+aiosqlite:///./data/streamgate.db"
+    # 必填：声明 upserts/SqlBackfill 时在引擎创建单点校验
+    # （缺失即装配失败，不做项目专属默认；纯 Kafka 管道无需配置）。
+    # 驱动按连接串动态加载：sqlite 需 extras [sqlite]，mssql 需 extras [mssql]。
+    connection_string: str | None = None
     echo: bool = False
     # --- L1 快速失败边界（异步落库链路加固）---
     query_timeout_seconds: int = 5      # existence 回源驱动语句超时（MSSQL；须 <= query_wait_seconds）
@@ -84,15 +87,25 @@ class DbConfig(BaseModel):
     write_pool_size: int = 10           # 写池固定连接数
     write_pool_max_overflow: int = 20   # 写池溢出连接数
 
+    def require_connection_string(self) -> str:
+        """连接串装配校验（引擎创建单点调用）：None 即配置错误，含修复指引。"""
+        if self.connection_string is None:
+            raise ValueError(
+                "db connection string is required when upserts or SqlBackfill are "
+                "declared: set DbConfig.connection_string (env: DB__CONNECTION_STRING), "
+                "e.g. 'sqlite+aiosqlite:///./data/streamgate.db'"
+            )
+        return self.connection_string
+
     @property
     def dialect(self) -> str:
         """驱动方言标签（日志/分支用）：sqlite | mssql。"""
-        return "sqlite" if "sqlite" in self.connection_string.lower() else "mssql"
+        return "sqlite" if "sqlite" in self.require_connection_string().lower() else "mssql"
 
     @property
     def redacted_connection_string(self) -> str:
         """隐藏密码后的连接串（日志用，避免凭据入日志）。"""
-        s = self.connection_string
+        s = self.require_connection_string()
         if "://" not in s or "@" not in s:
             return s
         scheme, _, rest = s.partition("://")

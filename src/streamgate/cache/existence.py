@@ -9,12 +9,15 @@
 
 import asyncio
 import json
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
-import redis.asyncio as aioredis
-
+from streamgate._optional import require_optional
 from streamgate.config import RedisConfig
 from streamgate.obs.logging import logger
+
+if TYPE_CHECKING:
+    # redis 是 extras 依赖（streamgate[redis]）：仅类型检查可见，运行时惰性装载
+    import redis.asyncio as aioredis
 
 _T = TypeVar("_T")
 
@@ -76,10 +79,12 @@ def dumps_summary(summary: dict[str, object]) -> str:
 
 
 class RedisExistenceCache:
-    def __init__(self, config: RedisConfig, client: aioredis.Redis | None = None) -> None:
+    def __init__(
+        self, config: RedisConfig, client: "aioredis.Redis | None" = None
+    ) -> None:
         self._config = config
         self._injected = client
-        self._client: aioredis.Redis | None = None
+        self._client: "aioredis.Redis | None" = None
 
     @property
     def existence_ttl_seconds(self) -> int:
@@ -91,6 +96,10 @@ class RedisExistenceCache:
         if self._injected is not None:
             self._client = self._injected
             return
+        # redis 为 extras 依赖：仅在此真正建连时装载（缺失抛带指引的 ImportError）
+        require_optional("redis.asyncio")
+        import redis.asyncio as aioredis
+
         self._client = aioredis.from_url(
             self._config.url,
             socket_timeout=self._config.socket_timeout_ms / 1000,
@@ -127,7 +136,7 @@ class RedisExistenceCache:
 
     # ---------- 内部工具 ----------
 
-    def _require_client(self) -> aioredis.Redis:
+    def _require_client(self) -> "aioredis.Redis":
         if self._client is None:
             raise RuntimeError("RedisExistenceCache not started, call start() first")
         return self._client

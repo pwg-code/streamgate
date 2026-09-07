@@ -49,19 +49,24 @@ def _set_driver_timeout(conn: object, timeout_seconds: int) -> None:
 
 
 def _is_sqlite(config: DbConfig) -> bool:
-    return "sqlite" in config.connection_string.lower()
+    return "sqlite" in config.require_connection_string().lower()
 
 
 def _create_engine(config: DbConfig, pool_size: int, max_overflow: int, timeout_seconds: int) -> AsyncEngine:
-    """引擎创建单点：内置 sqlite/mssql 分支、池参数、timeout 钩子挂载。"""
+    """引擎创建单点：内置 sqlite/mssql 分支、池参数、timeout 钩子挂载。
+
+    C7 装配校验：connection_string 缺失即在此抛错（含修复指引），
+    对齐 KAFKA__TOPIC / CONSUMER__GROUP_ID 的"必填即启动失败"语义。
+    """
+    connection_string = config.require_connection_string()
     if _is_sqlite(config):
         return create_async_engine(
-            config.connection_string,
+            connection_string,
             echo=config.echo,
             connect_args={"check_same_thread": False},
         )
     engine = create_async_engine(
-        config.connection_string,
+        connection_string,
         echo=config.echo,
         pool_size=pool_size,
         max_overflow=max_overflow,

@@ -1,9 +1,9 @@
 """SQLite 方言（dev/测试路径）：ON CONFLICT 优先，无唯一约束时 DELETE+INSERT 兜底。"""
 
 from sqlalchemy import text
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import SQLModel
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from streamgate.protocols import JsonObject
 

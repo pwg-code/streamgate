@@ -4,7 +4,7 @@ import asyncio
 
 from aiokafka import AIOKafkaConsumer
 from aiokafka.consumer.group_coordinator import GroupCoordinator
-from aiokafka.errors import KafkaError, KafkaConnectionError, CommitFailedError
+from aiokafka.errors import CommitFailedError, KafkaConnectionError, KafkaError
 from aiokafka.structs import ConsumerRecord, OffsetAndMetadata, TopicPartition
 
 from streamgate.config import ConsumerConfig, KafkaConfig

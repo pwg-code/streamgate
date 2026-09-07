@@ -21,6 +21,8 @@ from sqlalchemy.exc import (
     DataError,
     IntegrityError,
     OperationalError,
+)
+from sqlalchemy.exc import (
     TimeoutError as SQLAlchemyTimeoutError,
 )
 
