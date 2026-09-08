@@ -1,12 +1,14 @@
 """消费服务装配与生命周期（机制内核，无 HTTP 呈现）。
 
-职责：init sink（spec.sink，唯一落库路径）→ 启动 consumer/DLQ → 消费循环 →
+职责：init persist_policy（协议生命周期，框架保证调用时序）→ init sink
+（spec.sink，唯一落库路径）→ 启动 consumer/DLQ → 消费循环 →
 优雅停机（flush 缓冲、leave group、关资源）→ 健康快照。
 健康数据经 health_snapshot() 暴露；端点实现归使用方。
 """
 
 import asyncio
 import signal
+from collections.abc import Awaitable, Callable
 
 from streamgate.config import ConsumerConfig, KafkaConfig
 from streamgate.consumer.dlq import DlqProducer
@@ -25,6 +27,20 @@ from streamgate.transport.kafka import KafkaConsumerService
 DEFAULT_EXISTENCE_TTL_SECONDS = 18000
 
 
+async def _lifecycle_start(component: object) -> None:
+    """启动可选组件（鸭子类型防御：未实现 start() 的历史实现跳过）。"""
+    start: Callable[[], Awaitable[None]] | None = getattr(component, "start", None)
+    if start is not None:
+        await start()
+
+
+async def _lifecycle_close(component: object) -> None:
+    """释放可选组件（鸭子类型防御：未实现 close() 的历史实现跳过）。"""
+    close: Callable[[], Awaitable[None]] | None = getattr(component, "close", None)
+    if close is not None:
+        await close()
+
+
 class ConsumerWorker:
     def __init__(
         self,
@@ -40,7 +56,8 @@ class ConsumerWorker:
         """装配消费内核。
 
         cache：可选健康探测组件（鸭子类型：实现 check_health() 即被
-        /health 快照观测，如使用方自建的准入缓存）。
+        /health 快照观测，如使用方自建的准入缓存）。实现 start()/close()
+        时生命周期由框架托管（prepare 启动、shutdown 释放）。
         error_classifier：写侧异常分类器注入点；未注入用
         DefaultErrorClassifier（只认通用异常——接 DB 务必注入对应分类器，
         参考 examples/sqlite_sink/）。
@@ -81,6 +98,13 @@ class ConsumerWorker:
         """初始化全部组件（幂等入口）。"""
         if self.runtime is not None:
             return self.runtime
+
+        # 托管策略生命周期（AdmissionPolicy 协议契约：框架保证调用时序，
+        # 与 IngestGateway.start() 对齐；旁路注入的 cache 同步托管）
+        if self.spec.persist_policy is not None:
+            await _lifecycle_start(self.spec.persist_policy)
+        if self._cache is not None:
+            await _lifecycle_start(self._cache)
 
         writer = self.spec.sink
         if writer is not None:
@@ -183,10 +207,12 @@ class ConsumerWorker:
             await runtime.consumer.stop()
         if runtime.dlq is not None:
             await runtime.dlq.stop()
+        # 策略先于旁路 cache 释放：RedisExistenceAdmission.close() 已关闭
+        # 内部 cache 及 backfill；cache.close() 幂等，双保险亦安全
+        if runtime.persist_policy is not None:
+            await _lifecycle_close(runtime.persist_policy)
         if runtime.cache is not None:
-            close = getattr(runtime.cache, "close", None)
-            if close is not None:
-                await close()
+            await _lifecycle_close(runtime.cache)
         if runtime.writer is not None:
             await runtime.writer.close()
 

@@ -9,7 +9,7 @@
 import asyncio
 import json
 from collections.abc import Awaitable
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import redis.asyncio as aioredis
 
@@ -145,7 +145,14 @@ class RedisExistenceCache:
     # ---------- 读 ----------
 
     async def get_field_meta(self, entity: str, slot: str) -> dict[str, object] | None:
-        raw = await self._read(self._require_client().hget(self.existence_key(entity), slot))
+        # redis-py 命令类型为 ResponseT（Awaitable|值 联合，同步模式兼容）；
+        # 异步 client 恒返回 Awaitable，cast 仅为收窄静态类型
+        raw = await self._read(
+            cast(
+                "Awaitable[str | None]",
+                self._require_client().hget(self.existence_key(entity), slot),
+            )
+        )
         if raw is None:
             return None
         return parse_summary(str(raw))
@@ -154,9 +161,12 @@ class RedisExistenceCache:
         return bool(await self._read(self._require_client().exists(self.existence_key(entity))))
 
     async def get_entity_fields(self, entity: str) -> dict[str, dict[str, object]] | None:
-        raw: dict[str, str] = await self._read(
-            self._require_client().hgetall(self.existence_key(entity))
-        )  # type: ignore[assignment]
+        raw = await self._read(
+            cast(
+                "Awaitable[dict[str, str]]",
+                self._require_client().hgetall(self.existence_key(entity)),
+            )
+        )
         if not raw:
             return None  # Redis 中不存在只有 0 个 field 的 HASH，空 dict 即 key 不存在
         return {

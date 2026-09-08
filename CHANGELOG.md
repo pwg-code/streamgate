@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-09-08
+
+### Fixed
+
+- **`ConsumerWorker` now manages the `ConsumeSpec.persist_policy` lifecycle**
+  (the `AdmissionPolicy` protocol promises "the framework guarantees call
+  ordering", but the consumer entry point never honored it — unlike
+  `IngestGateway`, which calls `start()`/`close()`). `prepare()` now calls
+  `await policy.start()` before starting the sink, and `shutdown()` calls
+  `await policy.close()` before closing the writer. Previously the consumer
+  side never started the policy, so `on_persisted` authoritative refresh /
+  TTL heartbeats failed on every batch (e.g. `RedisExistenceAdmission`
+  logging `cache_refresh_failed: RedisExistenceCache not started`) and the
+  failure surfaced only as per-record WARN logs. Lifecycle calls are
+  duck-typed (defensive `getattr`) so legacy policy implementations without
+  `start()`/`close()` keep working.
+- **`ConsumerWorker(cache=...)` lifecycle is now symmetric.** The bypass
+  `cache` parameter (health-probe component) is started in `prepare()` when
+  it implements `start()`, instead of being closed at shutdown without ever
+  having been started. `RedisExistenceCache.start()`/`close()` are
+  idempotent, so sharing one cache instance between the policy and the
+  bypass parameter remains safe (double start/close is a no-op).
+  The pre-fix workaround (`await cache.start()` before `worker.run()`)
+  is no longer required.
+
 ## [0.3.0] - 2026-09-08
 
 **Contrib release.** The production-grade I/O strategies that 0.2.0 demoted to
