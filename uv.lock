@@ -775,37 +775,48 @@ dependencies = [
     { name = "pydantic" },
 ]
 
-[package.dev-dependencies]
-dev = [
+[package.optional-dependencies]
+http = [
+    { name = "httpx" },
+]
+redis = [
+    { name = "redis" },
+]
+sql = [
     { name = "aioodbc" },
     { name = "aiosqlite" },
-    { name = "httpx" },
-    { name = "import-linter" },
-    { name = "pyright" },
-    { name = "redis" },
-    { name = "ruff" },
     { name = "sqlalchemy" },
     { name = "sqlmodel" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "import-linter" },
+    { name = "pyright" },
+    { name = "ruff" },
+    { name = "streamgate", extra = ["http", "redis", "sql"] },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "aiokafka", specifier = ">=0.10" },
+    { name = "aioodbc", marker = "extra == 'sql'", specifier = ">=0.5" },
+    { name = "aiosqlite", marker = "extra == 'sql'", specifier = ">=0.19" },
+    { name = "httpx", marker = "extra == 'http'", specifier = ">=0.27" },
     { name = "loguru", specifier = ">=0.7" },
     { name = "pydantic", specifier = ">=2.5" },
+    { name = "redis", marker = "extra == 'redis'", specifier = ">=5" },
+    { name = "sqlalchemy", marker = "extra == 'sql'", specifier = ">=2.0" },
+    { name = "sqlmodel", marker = "extra == 'sql'", specifier = ">=0.0.16" },
 ]
+provides-extras = ["http", "redis", "sql"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "aioodbc", specifier = ">=0.5" },
-    { name = "aiosqlite", specifier = ">=0.19" },
-    { name = "httpx", specifier = ">=0.27" },
     { name = "import-linter", specifier = ">=2.0" },
     { name = "pyright", specifier = ">=1.1.380" },
-    { name = "redis", specifier = ">=5" },
     { name = "ruff", specifier = ">=0.6" },
-    { name = "sqlalchemy", specifier = ">=2.0" },
-    { name = "sqlmodel", specifier = ">=0.0.16" },
+    { name = "streamgate", extras = ["redis", "sql", "http"] },
 ]
 
 [[package]]

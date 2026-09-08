@@ -1,22 +1,23 @@
-"""Upsert 声明 + 幂等 upsert 编排（原 streamgate Upsert sugar 平移）。
+"""Upsert 声明 + 幂等 upsert 编排（RecordWriter 协议的 SQL 实现）。
 
-原核心的 `Upsert`（specs.py）与 `UpsertWriter`（db/upsert.py）合并为本模块，
-作为 RecordWriter 协议的参考实现演示注入用法。
+`Upsert`（声明）与 `UpsertWriter`（RecordWriter 协议实现）：多目标
+投影/校验/去重 + 方言 upsert（sqlite ON CONFLICT / mssql MERGE），
+单事务批量写。
 """
 
 import asyncio
 from collections.abc import Callable
 
-from config import DbConfig
-from dialects import mssql as mssql_dialect
-from dialects import sqlite as sqlite_dialect
-from dialects.mssql import mssql_cast_types
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlmodel import SQLModel
 
 from streamgate import logger
+from streamgate.contrib.sql_sink._dialects import mssql as mssql_dialect
+from streamgate.contrib.sql_sink._dialects import sqlite as sqlite_dialect
+from streamgate.contrib.sql_sink._dialects.mssql import mssql_cast_types
+from streamgate.contrib.sql_sink.config import DbConfig
 from streamgate.protocols import JsonObject, WriteResult
 
 # 行级变换钩子类型（Upsert.prepare 参数）
@@ -142,7 +143,7 @@ async def execute_upserts(
 
 
 class UpsertWriter:
-    """RecordWriter 参考实现：幂等 upsert 编排（含启动建表/健康探测/关闭）。"""
+    """RecordWriter 实现：幂等 upsert 编排（含启动建表/健康探测/关闭）。"""
 
     def __init__(
         self,

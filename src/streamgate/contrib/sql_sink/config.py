@@ -1,14 +1,14 @@
-"""示例本地 DB 配置（原框架 DbConfig 的示例化收敛）。
+"""SQL 落库配置（streamgate.contrib.sql_sink）。
 
-DB 是使用方的世界：连接配置由使用方自带，不进框架核心。
-仅保留 sqlite_sink 示例用到的字段；生产按需扩充（凭据走环境变量）。
+DB 是使用方的基础设施：连接配置由使用方自带，不进框架核心。
+生产按需扩充（凭据走环境变量）。
 """
 
 from pydantic import BaseModel
 
 
 class DbConfig(BaseModel):
-    """示例落库配置：连接串必填（缺失即装配失败，含修复指引）。"""
+    """落库配置：连接串必填（缺失即装配失败，含修复指引）。"""
 
     connection_string: str | None = None
     echo: bool = False

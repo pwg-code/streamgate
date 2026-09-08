@@ -12,9 +12,9 @@ from collections.abc import Awaitable
 from typing import TypeVar
 
 import redis.asyncio as aioredis
-from settings import RedisConfig
 
 from streamgate import logger
+from streamgate.contrib.redis_admission.config import RedisConfig
 
 _T = TypeVar("_T")
 

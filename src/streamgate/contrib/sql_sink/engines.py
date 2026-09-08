@@ -1,6 +1,5 @@
-"""引擎工厂（原 streamgate.db.engines 平移，读写池/超时钩子/唯一建引擎点）。"""
+"""引擎工厂（读写池/超时钩子/唯一建引擎点）。"""
 
-from config import DbConfig
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -10,6 +9,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from streamgate import logger
+from streamgate.contrib.sql_sink.config import DbConfig
 
 
 def make_query_timeout_hook(timeout_seconds: int):

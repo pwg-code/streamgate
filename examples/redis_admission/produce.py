@@ -3,7 +3,8 @@
 运行（先 docker compose up -d 启动 kafka + redis）：
     KAFKA__BOOTSTRAP_SERVERS=localhost:29092 python produce.py
 
-依赖（不随 streamgate 安装）：pip install redis
+依赖：pip install "streamgate[redis]"（策略实现已升级为
+streamgate.contrib.redis_admission 正式功能）。
 重复运行：第二次 o-1 得 CONFLICT（Redis 占位跨进程存活，与 pure_pipeline 的
 in-memory 版本不同：多实例部署安全）。
 """
@@ -11,16 +12,18 @@ in-memory 版本不同：多实例部署安全）。
 import asyncio
 import os
 
-from admission import RedisExistenceAdmission
-from existence import RedisExistenceCache
 from models import OrderIn
-from settings import RedisConfig
 
 from streamgate import (
     BackpressureConfig,
     IngestBinding,
     IngestGateway,
     KafkaConfig,
+)
+from streamgate.contrib.redis_admission import (
+    RedisConfig,
+    RedisExistenceAdmission,
+    RedisExistenceCache,
 )
 
 
@@ -44,7 +47,7 @@ def build_binding() -> IngestBinding[OrderIn]:
 def build_admission() -> RedisExistenceAdmission[OrderIn]:
     """存在性判定 + 原子占位：注入共享存储载体。
 
-    需要冷实体回源时传 backfill=SqlBackfill(...)（复制自 examples/sqlite_sink/backfill.py）。
+    需要冷实体回源时传 backfill=SqlBackfill(...)（streamgate.contrib.sql_sink）。
     """
     redis_config = RedisConfig(
         url=os.environ.get("REDIS__URL", "redis://localhost:6379/0")

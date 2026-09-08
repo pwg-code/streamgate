@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-08
+
+**Contrib release.** The production-grade I/O strategies that 0.2.0 demoted to
+copy-paste examples are back in the wheel — as `streamgate.contrib.*`,
+importable, opt-in subpackages. The core stays pure: it gains no dependencies,
+and it still never imports contrib (the import-linter forbidden contract is
+replaced by a layered contract with the same guarantee). Purely additive; no
+breaking changes.
+
+### Added
+
+- **`streamgate.contrib`** — official strategy layer (provisional / beta
+  grade; ships in the wheel, third-party deps via extras, friendly
+  "install streamgate[...]" errors when an extra is missing):
+  - `contrib.redis_admission` (extra `[redis]`): `RedisExistenceAdmission`,
+    `RedisExistenceCache`, `RedisConfig` — shared-storage uniqueness
+    admission with atomic Lua reservation, TTL idle-GC, empty-entity
+    sentinels, fail-closed semantics.
+  - `contrib.sql_sink` / `contrib.sqlite_sink` / `contrib.mssql_sink`
+    (extra `[sql]`): `Upsert`/`UpsertWriter` (`RecordWriter` impl),
+    engine factory, `SqlBackfill` (`BackfillSource` impl),
+    `SQLAlchemyErrorClassifier`, `DbConfig` — SQLite `ON CONFLICT` and
+    MSSQL multi-row `MERGE` + HOLDLOCK dialects.
+  - `contrib.http_probe` (extra `[http]`): `HttpProbeSignal` /
+    `HysteresisController` — backlog-age trip/recover hysteresis,
+    fail-closed probing, kafka-down fast reject.
+- **Extras** `[redis]` / `[sql]` / `[http]` (new names; the pre-0.2.0 extras
+  `[sqlite]` / `[mssql]` / `[http-probe]` / `[all]` are not restored).
+- **`examples/prod_pipeline/`** — production-topology demo wiring the three
+  contrib components together (Redis uniqueness admission + HTTP-probe
+  backpressure + MSSQL idempotent sink; runs on SQLite locally via
+  connection-string dialect selection).
+
+### Changed
+
+- **import-linter**: the "pure core" forbidden-modules contract is replaced
+  by a layered contract — `streamgate.contrib` sits on top and may use the
+  core; no core layer may import contrib. Bare-install purity is still
+  CI-gated (bare install pulls exactly `aiokafka`/`loguru`/`pydantic`).
+- **`examples/`**: the three strategy examples now import from
+  `streamgate.contrib`; demo scripts (produce/consume/health_server/models)
+  stay in the repo only. `pure_pipeline/` remains the zero-dependency main
+  example and is unchanged.
+- **Dev group** now depends on `streamgate[redis,sql,http]` instead of
+  duplicating the third-party libs, keeping a single source of truth for
+  contrib dependency versions.
+
 ## [0.2.0] - 2026-09-07
 
 **Pure-core release.** All database, Redis and HTTP-client code is removed from

@@ -52,8 +52,10 @@ sqlite3 data/pipeline.db "select * from orders;"
 
 - `InMemoryAdmission` is **single-process only** — memory is not shared across
   replicas. For multi-instance deployments inject a shared-storage admission
-  policy; see [`examples/redis_admission/`](../redis_admission/).
+  policy; use [`streamgate.contrib.redis_admission`](https://github.com/pwg-code/streamgate#contrib-official-strategy-implementations)
+  (see also [`examples/redis_admission/`](../redis_admission/) for a runnable demo).
 - `on_record` is the no-sink escape hatch: your callable owns the storage
   write, retries and pausing stay with the framework. For a typed
-  `RecordWriter` sink with DLQ bisection, see
-  [`examples/sqlite_sink/`](../sqlite_sink/).
+  `RecordWriter` sink with DLQ bisection, use
+  [`streamgate.contrib.sqlite_sink`](https://github.com/pwg-code/streamgate#contrib-official-strategy-implementations)
+  (see also [`examples/sqlite_sink/`](../sqlite_sink/)).

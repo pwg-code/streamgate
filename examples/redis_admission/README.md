@@ -1,17 +1,21 @@
 # redis_admission — shared-storage uniqueness admission via `AdmissionPolicy` injection
 
-The former built-in Redis admission (existence cache with cluster-safe Lua
-reservation, TTL idle-GC, empty-entity sentinels, fail-closed semantics) now
-lives here as copy-paste modules. The framework owns the admission
-orchestration; **the storage carrier is yours**.
+The Redis admission strategy (existence cache with cluster-safe Lua
+reservation, TTL idle-GC, empty-entity sentinels, fail-closed semantics) is a
+first-class contrib module: `streamgate.contrib.redis_admission`. It ships in
+the wheel and installs its dependency via the `[redis]` extra. The framework
+owns the admission orchestration; **the storage carrier is yours**.
+
+```bash
+pip install "streamgate[redis]"
+```
 
 ## Layout
 
 | Module | Contents |
 |--------|----------|
-| `existence.py` | `RedisExistenceCache` — entity→slot→summary HASH, atomic reservation via Lua, TTL heartbeats |
-| `admission.py` | `RedisExistenceAdmission` — `AdmissionPolicy` impl: check + reserve + overwrite precheck + fail-closed; cold-entity backfill hook (`BackfillSource`) |
-| `settings.py` | example-local Redis connection config |
+| `streamgate.contrib.redis_admission` | `RedisExistenceCache` (entity→slot→summary HASH, atomic Lua reservation, TTL heartbeats), `RedisExistenceAdmission` (`AdmissionPolicy` impl: check + reserve + overwrite precheck + fail-closed), `RedisConfig` |
+| `models.py`, `produce.py` | runnable demo (stays in the repo, not in the wheel) |
 
 ## Run
 
@@ -19,7 +23,7 @@ orchestration; **the storage carrier is yours**.
 # infrastructure (kafka + redis)
 docker compose up -d                # from examples/docker-compose.yml
 
-pip install streamgate redis
+pip install "streamgate[redis]"
 
 # produce — twice
 KAFKA__BOOTSTRAP_SERVERS=localhost:29092 python produce.py
@@ -32,11 +36,10 @@ KAFKA__BOOTSTRAP_SERVERS=localhost:29092 python produce.py
 
 ## Cold-entity backfill (optional)
 
-`RedisExistenceAdmission(backfill=...)` accepts any `BackfillSource` — for a
-SQL source copy `backfill.py` from [`examples/sqlite_sink/`](../sqlite_sink/)
-(`SqlBackfill`). With a backfill wired, cold entities are loaded from the
-database, fully cached into Redis, and 409s stay correct even after Redis
-flushes (TTL idle-GC).
+`RedisExistenceAdmission(backfill=...)` accepts any `BackfillSource` — use
+`SqlBackfill` from `streamgate.contrib.sql_sink` (extra `[sql]`). With a
+backfill wired, cold entities are loaded from the database, fully cached into
+Redis, and 409s stay correct even after Redis flushes (TTL idle-GC).
 
 ## Wire the consumer side
 

@@ -1,4 +1,4 @@
-"""HttpProbeSignal：周期探活远端 consumer 健康接口的背压信号（原核心实现平移）。
+"""HttpProbeSignal：周期探活远端 consumer 健康接口的背压信号（streamgate.contrib 正式功能）。
 
 判定语义（consumption-backpressure）：
 - 触发：backlog_age_seconds > trip_seconds
@@ -356,3 +356,6 @@ class HttpProbeSignal(HysteresisController):
                 consumer_health_url=self._config.consumer_health_url,
             )
         return probe
+
+
+__all__ = ["HysteresisController", "HttpProbeSignal"]

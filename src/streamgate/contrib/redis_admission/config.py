@@ -1,6 +1,6 @@
-"""示例本地 Redis 配置（原框架 RedisConfig 的示例化平移）。
+"""Redis 连接与存在性缓存配置（streamgate.contrib.redis_admission）。
 
-Redis 是使用方的世界：连接配置由使用方自带，不进框架核心。
+Redis 是使用方的基础设施：连接配置由使用方自带，不进框架核心。
 """
 
 from pydantic import BaseModel

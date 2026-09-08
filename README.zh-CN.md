@@ -14,14 +14,14 @@
               查重、限流、背压                        批量缓冲、重试、坏数据隔离
 ```
 
-框架只装 3 个依赖（`aiokafka` / `loguru` / `pydantic`），**包里没有一行数据库、Redis、HTTP 客户端代码**——所有"数据落到哪、用什么存"的实现都以可复制的示例放在 [`examples/`](examples/)。
+框架核心只装 3 个依赖（`aiokafka` / `loguru` / `pydantic`），核心层**没有一行数据库、Redis、HTTP 客户端代码**。官方 I/O 策略实现收录在 [`streamgate.contrib`](#不想自己写用-contrib)——按 extras 按需安装、装完即可 import；可运行的完整演示在 [`examples/`](examples/)。
 
 ---
 
 ## 为什么选它
 
 - **机制归框架，策略归你。** 查重流程、重试、限流、断线重连、优雅停机这些"脏活累活"框架全包；你只管业务语义（主键是什么、摘要放什么）和存储选型。
-- **查重不绑定存储。** 框架提供查重的"流程编排"（存在性判定 → 原子占位 → 冷回源 → 消费后刷新），至于用 Redis、进程内字典还是别的什么来存，由你注入。内置零依赖实现开箱即用，生产级 Redis 参考实现在 examples 里抄。
+- **查重不绑定存储。** 框架提供查重的"流程编排"（存在性判定 → 原子占位 → 冷回源 → 消费后刷新），至于用 Redis、进程内字典还是别的什么来存，由你注入。内置零依赖实现开箱即用；生产级 Redis 实现已收录为 `streamgate.contrib.redis_admission`（装 `[redis]` extra 即用）。
 - **一个写入钩子，接任何存储。** MySQL、ES、另一个服务、一个文件……实现 `RecordWriter` 接口注入即可。批量缓冲、失败重试、坏数据二分隔离这些框架替你兜底。
 - **错误分类也是钩子。** "连接超时该重试"还是"数据脏了该隔离"，只有懂你存储的人知道。注入一个分类器即可；不注入也有安全的默认行为（不会丢数据）。
 - **背压带磁滞防抖。** 消费端积压超标自动拒绝接收，回落后自动放行，来回抖动有磁滞带压着。
@@ -167,7 +167,7 @@ worker = ConsumerWorker(spec, ..., error_classifier=MyClassifier())
 
 不注入会怎样？默认分类器只认通用异常，不认识的都按 POISON 处理——不会丢数据（有探针保护），但会浪费一轮二分。**接数据库请务必注入对应分类器。**
 
-### 例 3：注入准入策略
+### 例 3：注入准入策略（含回源）
 
 ```python
 class MyAdmission:
@@ -179,28 +179,101 @@ class MyAdmission:
 binding = IngestBinding(..., admission=MyAdmission())       # 实例注入
 ```
 
-### 不想自己写？去 examples 抄
+单进程查重到这就够了。但如果查重数据放在"权威库的副本"里（如 Redis 分布式查重），副本可能与真相不一致：缓存重启清空后，来了一条"缓存里没有"的记录——是新数据，还是老数据丢了记录？不能瞎判。这时策略还需要一个核实渠道：**回源（BackfillSource）**——去权威数据库问一句"这个实体的历史摘要给我拉一份"，补回缓存再判定。
 
-每个例子都是**生产级质量、复制即用**（纳入 CI lint/类型检查，腐化会被拦下）：
+```python
+from streamgate.protocols import BackfillSource
 
-| 目录 | 给你什么 | 示例自身的额外依赖 |
-|---|---|---|
-| [`pure_pipeline/`](examples/pure_pipeline/) | 零依赖全链路（**主示例**，裸装跑通就是纯度承诺的活体证明） | 无 |
-| [`sqlite_sink/`](examples/sqlite_sink/) | SQL 幂等落库全套（引擎/方言/回源）+ 数据库异常分类器 | sqlalchemy、sqlmodel、aiosqlite |
-| [`redis_admission/`](examples/redis_admission/) | Redis 分布式查重（多实例安全，含 Lua 原子占位） | redis |
-| [`http_probe/`](examples/http_probe/) | 积压探针 + 磁滞限流状态机 | httpx |
+class MyBackfill:                              # 能力清单只有一个方法
+    async def load(self, entity: str) -> dict[str, dict]:
+        ...   # 返回 {slot: 摘要}；空 dict = 确认不存在
+              # 核实不了就抛异常（按"不确定"处理：宁可拒，不重复）
 
-仓库根的 [`examples/docker-compose.yml`](examples/docker-compose.yml) 提供 Kafka + Redis 双服务。
+admission = MyAdmission(backfill=MyBackfill())  # 回源传给你的策略，不是 gateway！
+```
+
+不配回源会怎样？缓存里查不到的记录，策略不会猜"这是新数据"，而是去问回源；默认的 `NoBackfill` 问不出结果（`load` 直接抛错），于是按"核实不了"处理——**拒绝，绝不放行**。这不是故障，是故意的兜底：拒绝可恢复（稍后重试即可），重复不可逆（进库就洗不掉）。
+
+| 回源配置 | 缓存查不到这条记录时 |
+|---|---|
+| 没配（默认 `NoBackfill`） | 核实不了 → 拒绝（fail-closed） |
+| 配了，权威库说"有这条" | conflict，409 返回既有摘要 |
+| 配了，权威库说"确实没有" | 放行（确认是新数据） |
+| 配了，但权威库也挂了 | 仍拒绝——核实不了绝不猜 |
+
+两个内置准入策略都用不上回源：`NoAdmission` 压根不查重；`InMemoryAdmission` 的进程内字典本身就是权威（查不到 = 真的没有），代价是仅单进程有效、重启即清空——一旦多副本部署，就需要 Redis 查重 + 回源的两级结构（`streamgate.contrib.redis_admission` + `streamgate.contrib.sql_sink.SqlBackfill` 已内置这套组合）。
+
+### 例 4：自定义背压信号（跟着消费端积压走）
+
+接收端怎么知道该不该拒收？每次 `process` 前问一次注入的信号源："现在能收吗？"——拒收期间请求自动得到 backpressure，积压回落后自动放行（磁滞防抖见下）。
+
+```python
+from streamgate.protocols import BackpressureSignal, BackpressureSnapshot
+
+class MySignal:                                # 不用继承，duck typing
+    async def snapshot(self) -> BackpressureSnapshot:
+        # 判定来源随你：探消费端状态接口 / 读本地指标……
+        return BackpressureSnapshot(rejecting=..., reason="backlog_high", lag=...)
+    async def start(self): ...
+    async def close(self): ...
+    @property
+    def rejecting(self) -> bool: ...           # 热路径只读这个布尔，保持便宜
+    @property
+    def reject_reason(self) -> str | None: ...
+
+gateway = IngestGateway(..., signal=MySignal())    # 注入即可
+```
+
+不注入会怎样？默认 `ManualBackpressureSignal`——纯手动开关，永远放行；维护窗口可把 `signal.rejecting` 翻成 `True` 手动挡闸。接收端与消费端不在同一进程时，框架"看不见"积压，用 `streamgate.contrib.http_probe`（积压探针 + 磁滞限流状态机，装 `[http]` extra）。
+
+### 不想自己写？用 contrib
+
+官方策略实现随 wheel 发布，按 extras 装依赖，**import 即用**（与核心同门禁：CI lint/类型检查全覆盖）：
+
+| Extra | 安装 | 子包 | 给你什么 |
+|---|---|---|---|
+| `[redis]` | `pip install "streamgate[redis]"` | `streamgate.contrib.redis_admission` | Redis 分布式查重（多实例安全，Lua 原子占位/冷回源/空实体哨兵/fail-closed） |
+| `[sql]` | `pip install "streamgate[sql]"` | `streamgate.contrib.sqlite_sink` / `.mssql_sink` / `.sql_sink` | SQL 幂等落库全套（SQLite ON CONFLICT / MSSQL MERGE+HOLDLOCK、引擎工厂、`SqlBackfill` 回源）+ 数据库异常分类器 |
+| `[http]` | `pip install "streamgate[http]"` | `streamgate.contrib.http_probe` | 积压探针 + 磁滞限流状态机（trip/recover 防抖、fail-closed） |
+
+```python
+from streamgate import IngestBinding
+from streamgate.contrib.redis_admission import (
+    RedisConfig, RedisExistenceAdmission, RedisExistenceCache,
+)
+
+binding = IngestBinding(
+    message_type="order",
+    entity_key=lambda r: r.order_id,
+    slot_key=lambda r: "order",
+    summary=lambda r: {"amount": r.amount},
+    admission=RedisExistenceAdmission(
+        cache=RedisExistenceCache(RedisConfig(url="redis://localhost:6379/0")),
+        entity_key=lambda r: r.order_id,
+        slot_key=lambda r: "order",
+        summary=lambda r: {"amount": r.amount},
+    ),
+)
+```
+
+缺对应 extra 时 import 会报错并提示该装哪个 extras，不会出现裸的 `ModuleNotFoundError`。
+
+**稳定性**：contrib 为 provisional（Beta 级）——可直接上生产（这些实现并入前已生产验证），但小版本内允许调整签名；核心 API 契约不受影响（核心层永不 import contrib）。
+
+仓库根的 [`examples/docker-compose.yml`](examples/docker-compose.yml) 提供 Kafka + Redis 双服务；五个可运行演示见 [`examples/`](examples/)（策略演示直接 import contrib；[`examples/prod_pipeline/`](examples/prod_pipeline/) 把 Redis 准入 + HTTP 探活 + MSSQL 落库的生产拓扑一次接全）。
 
 ---
 
 ## 安装
 
 ```bash
-pip install streamgate    # 只装 aiokafka + loguru + pydantic，没有 extras
+pip install streamgate             # 只装 aiokafka + loguru + pydantic
+pip install "streamgate[redis]"    # + Redis 分布式查重
+pip install "streamgate[sql]"      # + SQL 幂等落库（SQLite + MSSQL）
+pip install "streamgate[http]"     # + HTTP 探活背压
 ```
 
-存储/探针载体：从 `examples/` 复制对应模块，第三方库（redis、sqlalchemy、httpx 等）装进**你自己的项目**。其他数据库（PostgreSQL、MySQL……）：自己实现 `RecordWriter`——所有内置路径用的也是同一个钩子。
+其他数据库（PostgreSQL、MySQL……）：自己实现 `RecordWriter`——contrib 内置路径用的也是同一个钩子。
 
 ## 配置
 
@@ -224,13 +297,13 @@ pip install streamgate    # 只装 aiokafka + loguru + pydantic，没有 extras
         └─ 健康快照（用你自己的 Web 框架暴露）
 ```
 
-包内禁止任何 sqlalchemy / sqlmodel / redis / aiosqlite / aioodbc / httpx 导入——由 import-linter forbidden 契约在 CI 强制拦截。
+核心层禁止 import `streamgate.contrib`（contrib 反向依赖核心是合法的）——由 import-linter 分层契约在 CI 强制拦截；contrib 的第三方依赖全部走 extras 可选声明，裸装 `pip install streamgate` 不携带。
 
 ## 路线图
 
 - 测试套件（首发暂无测试；API 已在生产验证，项目视其为首要技术债）
 - 文档站
-- 更多 examples 参考实现
+- 更多 `streamgate.contrib` 策略实现
 
 ## 许可证
 

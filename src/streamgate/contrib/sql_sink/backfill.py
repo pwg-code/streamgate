@@ -1,7 +1,7 @@
-"""SQL 回源实现（原 streamgate.db.backfill.SqlBackfill 平移）。
+"""SQL 回源实现（BackfillSource 协议的 SQL 实现）。
 
-BackfillSource 协议的 SQL 参考：冷实体整实体加载 slot→summary，
-供 RedisExistenceAdmission 注入（见 examples/redis_admission/）。
+冷实体整实体加载 slot→summary，供
+streamgate.contrib.redis_admission 的 RedisExistenceAdmission 注入。
 """
 
 import asyncio
@@ -147,3 +147,6 @@ class SqlBackfill:
             if slot not in best or sort_key > best[slot][0]:
                 best[slot] = (sort_key, summary)
         return {slot: meta for slot, (_, meta) in best.items()}
+
+
+__all__ = ["SqlBackfill"]

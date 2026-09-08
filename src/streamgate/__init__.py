@@ -6,19 +6,20 @@
   Kafka 收发、批量缓冲、优雅停机
 - 策略归使用方：entity/slot/summary、Schema 校验、落地载体
   （RecordWriter / on_record / AdmissionPolicy 注入）；DB/Redis/HTTP 等
-  I/O 实现不进 wheel，可复制参考代码见仓库 examples/
+  I/O 策略实现收敛于 streamgate.contrib（随 wheel 发布、按 extras 携带
+  依赖，可运行演示见仓库 examples/）
 - 呈现归使用方：HTTP 路由/鉴权/OpenAPI、健康端点暴露（包内零 fastapi/uvicorn）
 
-核心依赖仅 aiokafka / loguru / pydantic 三项；包内禁止任何
-sqlalchemy / sqlmodel / redis 代码（import-linter forbidden 契约强制）。
+核心依赖仅 aiokafka / loguru / pydantic 三项；核心层不得 import
+streamgate.contrib（import-linter 分层契约强制）。
 
 Tier 0 声明式：IngestBinding + ConsumeSpec
     → IngestGateway（接收内核）/ ConsumerWorker（消费内核）
 Tier 1 组件替换：protocols.py 中的协议 + 下方内置零 I/O 实现
 Tier 2 逃生口：ConsumeSpec.on_record / ConsumeContext（只读快照）
 
-使用方只允许 import 本模块，不得深入内部子模块
-（import-linter 门禁强制）。
+使用方只允许 import 本模块与 streamgate.contrib.* 子包出口，
+不得深入其余内部子模块（import-linter 门禁强制）。
 """
 
 from streamgate.config import BackpressureConfig, ConsumerConfig, KafkaConfig
@@ -73,7 +74,7 @@ from streamgate.specs import ConsumeSpec, IngestBinding, IngestRecordT
 from streamgate.transport.codec import JsonEnvelopeCodec
 from streamgate.transport.kafka import KafkaConsumerService
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "AdmissionPolicy",

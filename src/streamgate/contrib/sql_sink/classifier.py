@@ -1,8 +1,8 @@
-"""SQLAlchemyErrorClassifier：DB 专属异常分类（ErrorClassifier 注入参考）。
+"""SQLAlchemyErrorClassifier：DB 专属异常分类（ErrorClassifier 实现）。
 
-接 DB 的使用方必须注入对应分类器：默认分类器不认识 DB 专有异常
+接 DB 的使用方应注入对应分类器：默认分类器不认识 DB 专有异常
 （会被兜底为 POISON，误进 DLQ——探针对照会兜住，但浪费一轮二分）。
-本实现可整体复制到你的项目，按所用数据库裁剪错误号表。
+按所用数据库裁剪错误号表。
 
 分类决定处置路径：
 - RETRY：连接/超时/死锁/池耗尽 → 保留既有 paused 无限自愈

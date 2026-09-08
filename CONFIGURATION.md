@@ -14,10 +14,56 @@ underscore):
 is missing, assembly fails at startup with an error that names the setting and
 how to fix it — the process never runs with project-specific guessed defaults.
 
-Database and Redis connection settings are **not part of the framework**:
+Database and Redis connection settings are **not part of the core framework**:
 storage carriers are injected via protocols and their configuration belongs to
-your application (see the example-local configs in `examples/sqlite_sink/` and
-`examples/redis_admission/`).
+your application. The official strategy implementations under
+`streamgate.contrib` ship typed config objects (below) that you construct and
+pass to the strategy classes.
+
+---
+
+## Contrib strategy configs
+
+These are plain constructor arguments (not env-mapped). All belong to
+`streamgate.contrib` packages — install the matching extra first
+(`[redis]` / `[sql]` / `[http]`).
+
+### `contrib.redis_admission.RedisConfig`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `url` | `redis://localhost:6379/0` | Redis connection URL. |
+| `key_prefix` | `streamgate:` | Key prefix for existence hashes. |
+| `existence_ttl_seconds` | `18000` | Existence hash TTL (idle-GC heartbeat: every write renews it). |
+| `empty_existence_ttl_seconds` | `3600` | Empty-entity sentinel TTL (shorter than existence TTL). |
+| `socket_timeout_ms` | `1000` | Read/query path timeout. |
+| `recv_timeout_ms` | `500` | Ingest path (reserve/summary write) timeout. |
+| `fail_closed_on_unavailable` | `true` | Reject instead of silently degrading when Redis is unavailable (`false` = legacy degraded escape hatch). |
+
+Strategy-level knobs live on `RedisExistenceAdmissionConfig`
+(`fail_closed_on_unavailable`, `cold_path_max_concurrency`, gate-full /
+unavailable `retry_after` seconds, stable error codes, `log_context` mapping).
+
+### `contrib.sql_sink.DbConfig`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `connection_string` | **required** | SQLAlchemy async URL (`sqlite+aiosqlite:///...` or `mssql+aioodbc://...`). Missing ⇒ assembly error with fix instructions. |
+| `echo` | `false` | SQLAlchemy echo logging. |
+| `write_timeout_seconds` | `20` | Driver statement timeout (MSSQL/pyodbc hook; must be < `write_wait_seconds`). |
+| `write_wait_seconds` | `25` | `UpsertWriter.write` call-level `wait_for` ceiling. |
+| `pool_timeout_seconds` | `3` | Pool checkout timeout (fail fast when exhausted). |
+| `write_pool_size` | `10` | Fixed write-pool connections. |
+| `write_pool_max_overflow` | `20` | Write-pool overflow connections. |
+
+The dialect (SQLite vs MSSQL) is selected by the connection string;
+`contrib.sqlite_sink` and `contrib.mssql_sink` are thin entry packages
+documenting each backend.
+
+### Backpressure probing (contrib.http_probe)
+
+`HttpProbeSignal` consumes the same `BACKPRESSURE__*` environment mapping via
+`BackpressureConfig` (see below) — no extra configuration surface.
 
 ---
 
@@ -60,8 +106,8 @@ your application (see the example-local configs in `examples/sqlite_sink/` and
 ## BackpressureConfig (`BACKPRESSURE__*`)
 
 The gateway defaults to the built-in `ManualBackpressureSignal` (static
-switch). For dynamic probing inject your own `BackpressureSignal` — the
-HTTP-probe reference in `examples/http_probe/` reads this config object.
+switch). For dynamic probing inject your own `BackpressureSignal` —
+`contrib.http_probe.HttpProbeSignal` reads this config object.
 
 | Env var | Default | Description |
 |---------|---------|-------------|

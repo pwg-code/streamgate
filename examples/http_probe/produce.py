@@ -3,7 +3,8 @@
 运行（先启动 consume.py，再运行本脚本）：
     KAFKA__BOOTSTRAP_SERVERS=localhost:29092 python produce.py
 
-依赖（不随 streamgate 安装）：pip install httpx
+依赖：pip install "streamgate[http]"（策略实现已升级为
+streamgate.contrib.http_probe 正式功能）。
 观察：把 consume.py 停掉（探活不可达 → fail-closed 拒绝），或人为调低
 BACKPRESSURE__TRIP_SECONDS 制造积压拒绝；恢复 consume.py 后磁滞放行。
 """
@@ -12,7 +13,6 @@ import asyncio
 import os
 
 from models import OrderIn
-from probe_signal import HttpProbeSignal
 
 from streamgate import (
     BackpressureConfig,
@@ -20,6 +20,7 @@ from streamgate import (
     IngestGateway,
     KafkaConfig,
 )
+from streamgate.contrib.http_probe import HttpProbeSignal
 
 
 def kafka_config() -> KafkaConfig:

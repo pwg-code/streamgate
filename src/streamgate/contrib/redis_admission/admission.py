@@ -1,4 +1,4 @@
-"""RedisExistenceAdmission：唯一性准入的参考实现（原 ingest/admission 平移）。
+"""RedisExistenceAdmission：唯一性准入（streamgate.contrib 正式功能）。
 
 协议适配层：entity+slot 原子占位（Lua）、idle-GC TTL、
 空实体哨兵、fail-closed、overwrite 预检；TTL/前缀/降级开关/错误码全参数化。
@@ -13,11 +13,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Generic
 
-from existence import RedisExistenceCache
 from redis.exceptions import RedisError
-from settings import RedisConfig
 
 from streamgate import logger
+from streamgate.contrib.redis_admission.config import RedisConfig
+from streamgate.contrib.redis_admission.existence import RedisExistenceCache
 from streamgate.protocols import (
     BackfillSource,
     Decision,

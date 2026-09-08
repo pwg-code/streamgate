@@ -1,17 +1,23 @@
 # http_probe — dynamic backpressure via `BackpressureSignal` injection
 
-The former built-in `HttpProbeSignal` (health-probe polling with a trip/recover
-hysteresis state machine, fail-closed probing, kafka-down fast reject) now
-lives here as a copy-paste module. The core ships only zero-I/O static signals
-(`ManualBackpressureSignal`, `AllowAllSignal`); dynamic topologies inject their
-own signal — this is the reference.
+The HTTP probe backpressure signal (health-probe polling with a trip/recover
+hysteresis state machine, fail-closed probing, kafka-down fast reject) is a
+first-class contrib module: `streamgate.contrib.http_probe`. It ships in the
+wheel and installs its dependency via the `[http]` extra. The core ships only
+zero-I/O static signals (`ManualBackpressureSignal`, `AllowAllSignal`);
+dynamic topologies inject their own signal — this is the reference.
+
+```bash
+pip install "streamgate[http]"
+```
 
 ## Layout
 
 | Module | Contents |
 |--------|----------|
-| `probe_signal.py` | `HysteresisController` (OPEN↔REJECTING state machine, backlog-age trip/recover, non-age reject recovery) + `HttpProbeSignal` (httpx polling with in-cycle retries) |
+| `streamgate.contrib.http_probe` | `HysteresisController` (OPEN↔REJECTING state machine, backlog-age trip/recover, non-age reject recovery) + `HttpProbeSignal` (httpx polling with in-cycle retries) |
 | `health_server.py` | demo-grade stdlib health endpoint serving `worker.health_snapshot()` — swap in your web framework for production |
+| `models.py`, `produce.py`, `consume.py` | runnable demo (stays in the repo, not in the wheel) |
 
 ## Run
 
@@ -19,7 +25,7 @@ own signal — this is the reference.
 # infrastructure
 docker compose up -d kafka         # from examples/docker-compose.yml
 
-pip install streamgate httpx
+pip install "streamgate[http]"
 
 # consume — hosts GET /health on :9109 (terminal 1)
 KAFKA__BOOTSTRAP_SERVERS=localhost:29092 python consume.py
