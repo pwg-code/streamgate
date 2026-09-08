@@ -22,7 +22,12 @@ Tier 2 逃生口：ConsumeSpec.on_record / ConsumeContext（只读快照）
 不得深入其余内部子模块（import-linter 门禁强制）。
 """
 
-from streamgate.config import BackpressureConfig, ConsumerConfig, KafkaConfig
+from streamgate.config import (
+    BackpressureConfig,
+    ConsumerConfig,
+    KafkaConfig,
+    MetricsConfig,
+)
 from streamgate.consumer.classifier import DefaultErrorClassifier
 from streamgate.consumer.dlq import (
     BisectOutcome,
@@ -74,7 +79,7 @@ from streamgate.specs import ConsumeSpec, IngestBinding, IngestRecordT
 from streamgate.transport.codec import JsonEnvelopeCodec
 from streamgate.transport.kafka import KafkaConsumerService
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "AdmissionPolicy",
@@ -113,6 +118,7 @@ __all__ = [
     "LoggingMetricsSink",
     "ManualBackpressureSignal",
     "MessageCodec",
+    "MetricsConfig",
     "MetricsSink",
     "NoAdmission",
     "NoBackfill",

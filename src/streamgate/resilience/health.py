@@ -13,6 +13,7 @@ from typing import Protocol
 from pydantic import BaseModel, Field
 
 from streamgate.obs.logging import logger
+from streamgate.obs.metrics import ConsumeMetrics, IngestMetrics
 
 
 class _ProducerHealthLike(Protocol):
@@ -74,6 +75,10 @@ class _ConsumerRuntimeLike(Protocol):
     @property
     def quarantined_count(self) -> int: ...
 
+    # 速率指标窗容器（旧运行时未接线时为 None，快照字段取默认 0.0）
+    @property
+    def metrics(self) -> ConsumeMetrics | None: ...
+
 
 class _AdmissionHealthLike(Protocol):
     """准入策略的健康观测面（非泛型结构协议：任意 AdmissionPolicy[R] 均满足，
@@ -102,6 +107,34 @@ class IngestHealthResponse(BaseModel):
         default=None,
         description="当前掉线持续时长（秒）；未掉线时 null",
     )
+    receive_rate: float = Field(
+        default=0.0,
+        description="近窗口 process() 调用速率（条/秒，含被拒调用，即入口总流量）",
+    )
+    admission_conflict_rate: float = Field(
+        default=0.0,
+        description="近窗口准入冲突（重复数据）速率（条/秒）",
+    )
+    backpressure_reject_rate: float = Field(
+        default=0.0,
+        description="近窗口背压拒绝速率（条/秒）",
+    )
+    produce_success_rate: float = Field(
+        default=0.0,
+        description="近窗口 Kafka 生产成功速率（条/秒）",
+    )
+    produce_failure_rate: float = Field(
+        default=0.0,
+        description="近窗口 Kafka 生产失败速率（条/秒）",
+    )
+    produce_latency_ms_avg: float = Field(
+        default=0.0,
+        description="近窗口生产耗时均值（毫秒，send 调用到 broker 确认）",
+    )
+    produce_latency_ms_max: float = Field(
+        default=0.0,
+        description="近窗口生产耗时最大值（毫秒）",
+    )
 
 
 class ConsumerHealthResponse(BaseModel):
@@ -124,6 +157,30 @@ class ConsumerHealthResponse(BaseModel):
     )
     quarantined_count: int = Field(
         description="进程生命周期内累计隔离至 DLQ 的坏数据条数",
+    )
+    consume_rate: float = Field(
+        default=0.0,
+        description="近窗口消费速率（条/秒，毒丸/未知类型不计入）",
+    )
+    sink_write_rate: float = Field(
+        default=0.0,
+        description="近窗口 writer 写入成功速率（条/秒）",
+    )
+    sink_write_failure_rate: float = Field(
+        default=0.0,
+        description="近窗口 writer 写入失败速率（条/秒）",
+    )
+    retry_rate: float = Field(
+        default=0.0,
+        description="近窗口写入重试速率（次/秒，瞬升即写库异常告警信号）",
+    )
+    sink_write_latency_ms_avg: float = Field(
+        default=0.0,
+        description="近窗口单批写入耗时均值（毫秒，按成功写计）",
+    )
+    sink_write_latency_ms_max: float = Field(
+        default=0.0,
+        description="近窗口单批写入耗时最大值（毫秒）",
     )
 
 
@@ -164,6 +221,7 @@ def _ingest_health_response(
     redis_healthy: bool,
     db_healthy: bool,
     timestamp: datetime,
+    metrics: IngestMetrics | None = None,
 ) -> IngestHealthResponse:
     """按探测结果构造快照（字段顺序为公共契约）。"""
     kafka_healthy, kafka_last_failure_at, kafka_reconnect_count, kafka_down_duration_seconds = kafka
@@ -175,6 +233,7 @@ def _ingest_health_response(
         redis=redis_healthy,
         database=db_healthy,
     )
+    m = metrics
     return IngestHealthResponse(
         status=status,
         kafka="connected" if kafka_healthy else "disconnected",
@@ -184,14 +243,37 @@ def _ingest_health_response(
         kafka_last_failure_at=kafka_last_failure_at,
         kafka_reconnect_count=kafka_reconnect_count,
         kafka_down_duration_seconds=kafka_down_duration_seconds,
+        receive_rate=m.received.rate_per_second() if m is not None else 0.0,
+        admission_conflict_rate=(
+            m.admission_conflict.rate_per_second() if m is not None else 0.0
+        ),
+        backpressure_reject_rate=(
+            m.backpressure_rejected.rate_per_second() if m is not None else 0.0
+        ),
+        produce_success_rate=(
+            m.produce_success.rate_per_second() if m is not None else 0.0
+        ),
+        produce_failure_rate=(
+            m.produce_failure.rate_per_second() if m is not None else 0.0
+        ),
+        produce_latency_ms_avg=(
+            m.produce_latency.latency_avg_ms() if m is not None else 0.0
+        ),
+        produce_latency_ms_max=(
+            m.produce_latency.latency_max_ms() if m is not None else 0.0
+        ),
     )
 
 
 async def collect_ingest_health(
     producer: _ProducerHealthLike | None,
     admission: _AdmissionHealthLike | None,
+    metrics: IngestMetrics | None = None,
 ) -> IngestHealthResponse:
-    """ingest 侧健康快照：并发探测 Kafka / Redis / 回源库。"""
+    """ingest 侧健康快照：并发探测 Kafka / Redis / 回源库。
+
+    metrics：速率指标窗容器（IngestGateway 持有）；未接线时速率字段取默认 0.0。
+    """
     kafka = await _probe_producer(producer)
     redis_task = (
         admission.check_cache_health() if admission is not None else _absent()
@@ -201,7 +283,8 @@ async def collect_ingest_health(
     )
     redis_healthy, db_healthy = await asyncio.gather(redis_task, db_task)
     return _ingest_health_response(
-        kafka, bool(redis_healthy), bool(db_healthy), datetime.now(timezone.utc)
+        kafka, bool(redis_healthy), bool(db_healthy),
+        datetime.now(timezone.utc), metrics,
     )
 
 
@@ -230,7 +313,11 @@ def _state_str(ok: bool | None) -> str | None:
 async def collect_consumer_health(
     runtime: _ConsumerRuntimeLike,
 ) -> ConsumerHealthResponse:
-    """consumer 侧健康快照：三子检查并发（DB 黑洞时快照不能挂死）。"""
+    """consumer 侧健康快照：三子检查并发（DB 黑洞时快照不能挂死）。
+
+    速率字段读取 runtime.metrics（未接线/停机态取模型默认 0.0）；
+    读取只读不重置，连续拉取数值一致。
+    """
     kafka_ok, db_ok, redis_ok = await asyncio.gather(
         _probe_kafka(runtime), _probe_component(runtime.writer),
         _probe_component(runtime.cache),
@@ -240,6 +327,7 @@ async def collect_consumer_health(
         if runtime.backlog_oldest_ts is not None
         else None
     )
+    m = runtime.metrics
     return ConsumerHealthResponse(
         status=_consumer_status(runtime.paused, kafka_ok, db_ok, redis_ok),
         kafka="connected" if kafka_ok else "disconnected",
@@ -250,6 +338,18 @@ async def collect_consumer_health(
         lag=runtime.consumer.lag if runtime.consumer else 0,
         backlog_age_seconds=backlog_age_seconds,
         quarantined_count=runtime.quarantined_count,
+        consume_rate=m.consumed.rate_per_second() if m is not None else 0.0,
+        sink_write_rate=m.sink_written.rate_per_second() if m is not None else 0.0,
+        sink_write_failure_rate=(
+            m.sink_write_failed.rate_per_second() if m is not None else 0.0
+        ),
+        retry_rate=m.retries.rate_per_second() if m is not None else 0.0,
+        sink_write_latency_ms_avg=(
+            m.sink_write_latency.latency_avg_ms() if m is not None else 0.0
+        ),
+        sink_write_latency_ms_max=(
+            m.sink_write_latency.latency_max_ms() if m is not None else 0.0
+        ),
     )
 
 

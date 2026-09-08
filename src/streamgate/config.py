@@ -85,3 +85,19 @@ class BackpressureConfig(BaseModel):
     reject_on_any_degraded: bool = False                # 旧行为逃生门：任何 degraded 即拒绝（恢复全量拒绝语义）
     # R3 背压周期分级：REJECTING 态高频探活间隔（秒）；OPEN 态仍用 check_interval_seconds
     unhealthy_check_interval_seconds: float = 5.0
+
+
+class MetricsConfig(BaseModel):
+    """健康快照速率指标配置（滑动窗口长度，ingest/consume 两侧共用）。"""
+
+    window_seconds: int = 60
+
+    @field_validator("window_seconds")
+    @classmethod
+    def check_window_seconds(cls, v: int) -> int:
+        if not 1 <= v <= 600:
+            raise ValueError(
+                "window_seconds out of range; "
+                "set METRICS__WINDOW_SECONDS to a value between 1 and 600"
+            )
+        return v

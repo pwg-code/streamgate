@@ -9,6 +9,7 @@ underscore):
 | `KAFKA__` | `KafkaConfig` |
 | `CONSUMER__` | `ConsumerConfig` |
 | `BACKPRESSURE__` | `BackpressureConfig` |
+| `METRICS__` | `MetricsConfig` |
 
 **Fail-fast semantics:** required settings are not defaulted. If a required value
 is missing, assembly fails at startup with an error that names the setting and
@@ -123,3 +124,16 @@ switch). For dynamic probing inject your own `BackpressureSignal` —
 | `BACKPRESSURE__FAIL_CLOSED_ON_UNREACHABLE` | `true` | Treat unreachable probe (retries exhausted) as backlog-exceeded. |
 | `BACKPRESSURE__REJECT_ON_ANY_DEGRADED` | `false` | Legacy escape hatch: reject when any component is degraded. |
 | `BACKPRESSURE__UNHEALTHY_CHECK_INTERVAL_SECONDS` | `5.0` | Poll period while REJECTING. |
+
+## MetricsConfig (`METRICS__*`)
+
+Health-snapshot rate metrics: both `IngestGateway` and `ConsumerWorker`
+maintain in-memory sliding windows and expose computed rates / latencies
+through their health snapshots (`receive_rate`, `sink_write_rate`,
+`produce_latency_ms_avg`, ...). Windowed aggregates are computed on read —
+no background tasks, no extra endpoint; rates decay to `0.0` once traffic
+stops for longer than the window.
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `METRICS__WINDOW_SECONDS` | `60` | Sliding-window length (seconds) for all rate/latency fields. Valid range 1–600; out-of-range values fail at startup. Short windows react faster but are noisier. |

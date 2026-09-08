@@ -22,7 +22,7 @@ from streamgate.consumer.dlq import (
     locate_and_write,
 )
 from streamgate.obs.logging import logger
-from streamgate.obs.metrics import DEFAULT_METRICS, MetricsSink
+from streamgate.obs.metrics import DEFAULT_METRICS, ConsumeMetrics, MetricsSink
 from streamgate.protocols import (
     AdmissionPolicy,
     ConsumeContext,
@@ -61,7 +61,8 @@ class ConsumeRuntime:
         persist_policy: AdmissionPolicy[JsonObject] | None = None,
         cache: object | None = None,
         dlq: DlqProducer | None = None,
-        metrics: MetricsSink | None = None,
+        metrics_sink: MetricsSink | None = None,
+        metrics: ConsumeMetrics | None = None,
         error_classifier: ErrorClassifier | None = None,
     ) -> None:
         self.spec = spec
@@ -73,7 +74,9 @@ class ConsumeRuntime:
         self.persist_policy = persist_policy
         self.cache = cache
         self.dlq = dlq
-        self.metrics = metrics or DEFAULT_METRICS
+        self.metrics_sink = metrics_sink or DEFAULT_METRICS
+        # 速率指标窗（默认构造 60s 窗口；构造时刻即进程启动锚点）
+        self.metrics = metrics if metrics is not None else ConsumeMetrics()
         self.error_classifier = error_classifier or DefaultErrorClassifier()
         self.buffer: list[BufferedMessage] = []
         self.last_write_at: datetime | None = None
@@ -260,6 +263,20 @@ async def _try_handler_batch(runtime: ConsumeRuntime) -> bool:
     return False
 
 
+def _note_sink_write_success(
+    runtime: ConsumeRuntime, batch_size: int, duration_ms: float
+) -> None:
+    """入库成功埋点：入库条数 + 单批写入耗时（仅成功批次记延迟，防超时污染 avg/max）。"""
+    runtime.metrics.sink_written.record(batch_size)
+    runtime.metrics.sink_write_latency.record_latency(duration_ms)
+
+
+def _note_sink_write_failure(runtime: ConsumeRuntime, batch_size: int) -> None:
+    """入库失败埋点：失败条数 + 重试次数（每次捕获异常各计一次）。"""
+    runtime.metrics.sink_write_failed.record(batch_size)
+    runtime.metrics.retries.record(1)
+
+
 async def _try_upsert_batch(runtime: ConsumeRuntime) -> bool:
     """sink 模式：按 ErrorClassifier 分类处置——
     RETRY 退避重试 → POISON 立即转 DLQ 二分隔离 → FATAL 停机。"""
@@ -276,6 +293,7 @@ async def _try_upsert_batch(runtime: ConsumeRuntime) -> bool:
             t0 = time.monotonic()
             result = await writer.write([m.data for m in batch])
             duration_ms = round((time.monotonic() - t0) * 1000, 1)  # 写耗时指标
+            _note_sink_write_success(runtime, batch_size, duration_ms)
             runtime.last_write_at = datetime.now(timezone.utc)
             runtime.buffer.clear()                      # 先清 buffer（数据已落库）
             runtime.backlog_oldest_ts = None            # 积压已清（下一批重新计）
@@ -291,6 +309,7 @@ async def _try_upsert_batch(runtime: ConsumeRuntime) -> bool:
             )
             return True
         except Exception as e:
+            _note_sink_write_failure(runtime, batch_size)
             kind = runtime.error_classifier.classify(e, attempt)
             backoff = config.retry_backoff_base * (2**attempt)
             logger.error(
@@ -374,6 +393,9 @@ async def _finalize_bisect_outcome(
     runtime.backlog_oldest_ts = None
     runtime.last_write_at = datetime.now(timezone.utc)
     runtime.quarantined_count += len(outcome.quarantined)
+    # 好条计入库成功；被隔离条视为入库失败（不计延迟：未真正写入库）
+    runtime.metrics.sink_written.record(len(outcome.written))
+    runtime.metrics.sink_write_failed.record(len(outcome.quarantined))
     for q in outcome.quarantined:
         log_ctx = (
             runtime.spec.log_context(q.message.data)
@@ -554,6 +576,7 @@ async def _process_record(
             raw_value=value,
         )
     )
+    runtime.metrics.consumed.record(1)  # 合法消息才计入消费速率
     _note_backlog_ts(runtime, record.timestamp)  # 追最老未落库消息
 
 

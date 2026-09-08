@@ -10,10 +10,11 @@ import asyncio
 import signal
 from collections.abc import Awaitable, Callable
 
-from streamgate.config import ConsumerConfig, KafkaConfig
+from streamgate.config import ConsumerConfig, KafkaConfig, MetricsConfig
 from streamgate.consumer.dlq import DlqProducer
 from streamgate.consumer.loop import ConsumeRuntime, consume_loop
 from streamgate.obs.logging import logger
+from streamgate.obs.metrics import ConsumeMetrics
 from streamgate.protocols import ErrorClassifier, MessageCodec
 from streamgate.resilience.health import (
     ConsumerHealthResponse,
@@ -52,6 +53,7 @@ class ConsumerWorker:
         cache: object | None = None,
         existence_ttl_seconds: int | None = None,
         error_classifier: ErrorClassifier | None = None,
+        metrics_config: MetricsConfig | None = None,
     ) -> None:
         """装配消费内核。
 
@@ -61,6 +63,8 @@ class ConsumerWorker:
         error_classifier：写侧异常分类器注入点；未注入用
         DefaultErrorClassifier（只认通用异常——接 DB 务必注入对应分类器，
         参考 examples/sqlite_sink/）。
+        metrics_config：健康快照速率指标配置（滑动窗口长度）；未注入用
+        默认 60s 窗口。
         """
         self.spec = spec
         self._kafka_config = kafka_config
@@ -73,6 +77,7 @@ class ConsumerWorker:
             else DEFAULT_EXISTENCE_TTL_SECONDS
         )
         self._error_classifier = error_classifier
+        self._metrics_config = metrics_config
         self.runtime: ConsumeRuntime | None = None
         self._stop_event: asyncio.Event | None = None
 
@@ -129,6 +134,14 @@ class ConsumerWorker:
         if dlq is not None:
             await dlq.start()
 
+        metrics_config = self._metrics_config
+        metrics = ConsumeMetrics(
+            window_seconds=(
+                metrics_config.window_seconds
+                if metrics_config is not None
+                else 60
+            ),
+        )
         self.runtime = ConsumeRuntime(
             spec=self.spec,
             consumer_config=self._consumer_config,
@@ -139,6 +152,7 @@ class ConsumerWorker:
             persist_policy=self.spec.persist_policy,
             cache=self._cache,
             dlq=dlq,
+            metrics=metrics,
             error_classifier=self._error_classifier,
         )
         return self.runtime

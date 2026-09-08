@@ -5,14 +5,16 @@ IngestOutcome，不抛 HTTP 异常、不构造 Response。日志事件名与字�
 契约（与历史 HTTP 版逐字一致）。
 """
 
+import time
 from datetime import datetime, timezone
 from typing import Generic
 
-from streamgate.config import BackpressureConfig, KafkaConfig
+from streamgate.config import BackpressureConfig, KafkaConfig, MetricsConfig
 from streamgate.ingest.admission.in_memory import InMemoryAdmission
 from streamgate.ingest.admission.no_admission import NoAdmission
 from streamgate.ingest.producer import KafkaProducerService
 from streamgate.obs.logging import logger
+from streamgate.obs.metrics import IngestMetrics
 from streamgate.protocols import (
     AdmissionPolicy,
     BackpressureSignal,
@@ -46,6 +48,7 @@ class IngestGateway(Generic[IngestRecordT]):
         backpressure_config: BackpressureConfig,
         signal: BackpressureSignal | None = None,
         codec: MessageCodec | None = None,
+        metrics_config: MetricsConfig | None = None,
     ) -> None:
         self.binding = binding
         self._kafka_config = kafka_config
@@ -55,6 +58,9 @@ class IngestGateway(Generic[IngestRecordT]):
         self._admission = self._resolve_admission()
         self._producer: KafkaProducerService | None = None
         self._started = False
+        # 速率指标窗（构造时刻即进程启动锚点；不配置走默认 60s 窗口）
+        metrics = metrics_config if metrics_config is not None else MetricsConfig()
+        self._metrics = IngestMetrics(window_seconds=metrics.window_seconds)
 
     # ---- 组件解析（声明期）----
 
@@ -142,6 +148,7 @@ class IngestGateway(Generic[IngestRecordT]):
         """
         if not self._started:
             raise RuntimeError("IngestGateway is not started, call start() first")
+        self._metrics.received.record()  # 入口总流量（含后续被拒的调用）
         binding = self.binding
         log_ctx = (
             binding.log_context(record) if binding.log_context is not None else {}
@@ -172,7 +179,9 @@ class IngestGateway(Generic[IngestRecordT]):
 
     async def health(self) -> IngestHealthResponse:
         """健康快照（数据归框架，暴露方式归使用方）。"""
-        return await collect_ingest_health(self._producer, self._admission)
+        return await collect_ingest_health(
+            self._producer, self._admission, metrics=self._metrics
+        )
 
     # ---- 内部分支 ----
 
@@ -184,6 +193,7 @@ class IngestGateway(Generic[IngestRecordT]):
         overwrite: bool,
     ) -> IngestOutcome:
         """背压拒绝（拒绝期零写入：不占位、不写 Redis、不写 Kafka）。"""
+        self._metrics.backpressure_rejected.record()
         binding = self.binding
         error_code = binding.backpressure_error_codes.get(
             snapshot.reason or "", binding.backpressure_default_code
@@ -211,6 +221,7 @@ class IngestGateway(Generic[IngestRecordT]):
         """存在性校验 + 原子占位。返回 Outcome = 409/4xx/5xx 短路；None = 继续。"""
         decision = await self._admission.admit(record)
         if decision.kind is DecisionKind.CONFLICT:
+            self._metrics.admission_conflict.record()
             summary = decision.summary or {}
             logger.info(
                 "ingest_conflict",
@@ -252,9 +263,11 @@ class IngestGateway(Generic[IngestRecordT]):
             _iso_z(received_at),
             source,
         )
+        t0 = time.monotonic()
         try:
             await producer.send(key=key, message=message)
         except Exception as e:
+            self._metrics.produce_failure.record()
             logger.error(
                 "kafka_send_failed",
                 **log_ctx,
@@ -266,6 +279,10 @@ class IngestGateway(Generic[IngestRecordT]):
                 error_code=binding.kafka_unavailable_code,
                 detail=binding.kafka_unavailable_detail,
             )
+        self._metrics.produce_success.record()
+        self._metrics.produce_latency.record_latency(
+            (time.monotonic() - t0) * 1000.0  # send 调用到 broker 确认耗时（毫秒）
+        )
 
         # ---- overwrite 路径：Kafka 成功后幂等摘要写（实现内自定重试）----
         cache_updated = await self._admission.on_accepted(record) if overwrite else True

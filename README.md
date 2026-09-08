@@ -21,6 +21,7 @@ The wheel installs exactly three dependencies (`aiokafka`, `loguru`, `pydantic`)
 - **Error classification as a hook.** Transient vs. poison vs. fatal is storage-specific knowledge. Inject an `ErrorClassifier`; the default only knows generic exceptions (and maps unknowns to poison — probe-protected bisect, never silent drops). A production-hardened SQLAlchemy classifier ships as `streamgate.contrib.sql_sink.SQLAlchemyErrorClassifier`.
 - **Backpressure with hysteresis.** Ingest probes consumer health on a side channel and rejects based on backlog age with separate trip/recover thresholds. The core ships zero-I/O signals (`ManualBackpressureSignal`); the HTTP-probe implementation ships as [`streamgate.contrib.http_probe`](#contrib-official-strategy-implementations).
 - **DLQ bisection instead of head-of-line blocking.** A poison message never wedges a partition: the failing batch is bisected with probe comparison, the bad record is quarantined to a dead-letter topic, the rest commits.
+- **Ops visibility built into the snapshot.** Health snapshots carry rate/latency metrics (receive rate, admission conflicts, produce success/failure, sink write rate, retries, write latency avg/max) computed over a configurable sliding window — your existing `/health` endpoint doubles as a monitoring feed, no Prometheus required.
 
 ## Quick Start
 
@@ -100,7 +101,7 @@ your HTTP app (presentation is yours: auth/routing/OpenAPI)
         ▼                                                  │      (bisect + probe compare)
   ConsumerWorker ──► RecordWriter (your storage) ──────────┘
         │             └─ ErrorClassifier (injected)
-        └─ health snapshot (expose it with your own web framework)
+        └─ health snapshot (state + rates/latencies; expose it with your own web framework)
 ```
 
 The package contains **zero web-framework code** (no fastapi/uvicorn), and the core layers never import `streamgate.contrib` — enforced by the import-linter layered contract in CI.

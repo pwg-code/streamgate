@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-08
+
+### Added
+
+- **Health snapshots now carry ops rate/latency metrics.** Both
+  `IngestHealthResponse` and `ConsumerHealthResponse` gain sliding-window
+  fields (all defaulting to `0.0`, computed on read over a 1-second bucket
+  sliding window — no background tasks, no extra endpoint):
+  - ingest: `receive_rate`, `admission_conflict_rate`,
+    `backpressure_reject_rate`, `produce_success_rate`,
+    `produce_failure_rate`, `produce_latency_ms_avg`,
+    `produce_latency_ms_max`;
+  - consume: `consume_rate`, `sink_write_rate`, `sink_write_failure_rate`,
+    `retry_rate`, `sink_write_latency_ms_avg`, `sink_write_latency_ms_max`.
+  Rates are records/second, latencies milliseconds; the window length is
+  configurable via the new `MetricsConfig` (`METRICS__WINDOW_SECONDS`,
+  default `60`, range 1–600). `IngestGateway(metrics_config=...)` and
+  `ConsumerWorker(metrics_config=...)` accept it; when omitted everything
+  works with the default window. Purely additive — old consumers that
+  deserialize the snapshot ignore the new fields.
+- **`MetricsConfig`** exported from the package root.
+
+### Changed
+
+- `ConsumeRuntime.__init__`: the structured-metrics sink parameter
+  `metrics` was renamed to `metrics_sink` to free the `metrics` name for
+  the new rate-metrics container (`ConsumeMetrics`). No in-repo caller
+  passed it explicitly; external callers using `metrics=<MetricsSink>`
+  must rename the keyword.
+
 ## [0.3.1] - 2026-09-08
 
 ### Fixed
