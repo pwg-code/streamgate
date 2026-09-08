@@ -83,8 +83,9 @@ jobs:
           uv venv bare
           uv pip install --python bare/bin/python .
       - name: "Smoke: dependency tree is pure (no DB/redis/httpx carriers)"
+        # uv venv 不内置 pip：用 uv pip list 读取裸环境依赖清单
         run: |
-          bare/bin/python -m pip list --format=freeze > deps.txt
+          uv pip list --python bare/bin/python --format=freeze > deps.txt
           cat deps.txt
           for pkg in sqlalchemy sqlmodel redis aiosqlite aioodbc httpx; do
             if grep -qi "^${pkg}==" deps.txt; then
