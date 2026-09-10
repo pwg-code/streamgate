@@ -173,7 +173,11 @@ worker = ConsumerWorker(spec, ..., error_classifier=MyClassifier())
 ```python
 class MyAdmission:
     async def admit(self, record, *, overwrite=False): ...  # 判定：允许/冲突/拒绝
-    async def on_accepted(self, record): ...                # Kafka 发送成功后
+    async def on_send_success(self, record): ...            # 每次 Kafka 发送成功后（通知型）
+    async def on_send_failed(self, record): ...             # 发送失败后；默认保留占位自愈，
+                                                            # 也可在此释放占位换"立即可重发"
+    async def on_overwrite_accepted(self, record): ...      # 仅 overwrite：摘要写，返回 False
+                                                            # → cache_updated=false
     async def on_persisted(self, record): ...               # 消费落库成功后刷新
     # 另有 start / close / 健康探测方法，见 protocols.py
 

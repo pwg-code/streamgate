@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-10
+
+### Added
+
+- **`AdmissionPolicy` gains `on_send_success` / `on_send_failed` hooks.**
+  `on_send_success(record)` fires after every broker-acked Kafka send
+  (overwrite path included); `on_send_failed(record)` fires when a send
+  fails after the admission reservation was placed. The framework default
+  (no-op) preserves current behavior — the placeholder stays reserved and
+  self-heals via TTL/backfill — but implementations can now release the
+  reservation to make the key immediately re-submittable, accepting the
+  duplicate risk of ambiguous (timeout) failures.
+
+### Changed
+
+- **`AdmissionPolicy.on_accepted` renamed to `on_overwrite_accepted`.**
+  The old hook only fired on the overwrite path (not on every accepted
+  send, despite the name); the new name states that. Custom policies that
+  implement `on_accepted` keep working: the gateway falls back to it when
+  `on_overwrite_accepted` is absent. Built-in policies provide both
+  (the old name delegates to the new one).
+
 ## [0.4.0] - 2026-09-08
 
 ### Added
@@ -214,5 +236,7 @@ First public release. Data pipeline framework: conditional admission → reliabl
   - Mechanisms as core dependencies; all policy carriers (DB drivers, redis, httpx) as optional extras with lazy loading and install-guidance errors.
   - Typed configuration objects mapping 1:1 to `KAFKA__*` / `CONSUMER__*` / `DB__*` / `REDIS__*` / `BACKPRESSURE__*` environment variables; required settings fail fast at startup.
 
+[0.5.0]: https://github.com/pwg-code/streamgate/releases/tag/v0.5.0
+[0.4.0]: https://github.com/pwg-code/streamgate/releases/tag/v0.4.0
 [0.2.0]: https://github.com/pwg-code/streamgate/releases/tag/v0.2.0
 [0.1.0]: https://github.com/pwg-code/streamgate/releases/tag/v0.1.0

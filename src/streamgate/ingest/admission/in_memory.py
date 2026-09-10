@@ -18,8 +18,9 @@ from streamgate.protocols import Decision, JsonObject, RecordT
 class InMemoryAdmission(Generic[RecordT]):
     """唯一性契约的进程内实现：检查 + 原子占位 + 摘要刷新。
 
-    框架保证调用时序：admit → (Kafka 发送) → on_accepted（仅 overwrite 路径）；
-    消费侧落库成功 → on_persisted（权威刷新）。
+    框架保证调用时序：admit → (Kafka 发送) → on_send_success（每次成功，通知型）/
+    on_send_failed（每次失败，默认保留占位自愈）→ on_overwrite_accepted（仅
+    overwrite 路径）；消费侧落库成功 → on_persisted（权威刷新）。
     """
 
     def __init__(
@@ -37,7 +38,7 @@ class InMemoryAdmission(Generic[RecordT]):
 
     async def admit(self, record: RecordT, *, overwrite: bool = False) -> Decision:
         if overwrite:
-            # 409 确认后的完整重发：跳过唯一性判定（摘要由 on_accepted 刷新）
+            # 409 确认后的完整重发：跳过唯一性判定（摘要由 on_overwrite_accepted 刷新）
             return Decision.allow()
         key = (str(self._entity_key(record)), str(self._slot_key(record)))
         existing = self._store.get(key)
@@ -46,12 +47,24 @@ class InMemoryAdmission(Generic[RecordT]):
         self._store[key] = self._summary(record)
         return Decision.allow()
 
-    async def on_accepted(self, record: RecordT) -> bool:
+    async def on_send_success(self, record: RecordT) -> None:
+        """通知型钩子：占位已在 admit 写入，无需动作。"""
+        return None
+
+    async def on_send_failed(self, record: RecordT) -> None:
+        """默认保留占位（自愈）；需"失败立即可重发"可在此删除 _store 键。"""
+        return None
+
+    async def on_overwrite_accepted(self, record: RecordT) -> bool:
         """overwrite 路径摘要写（内存操作恒成功）。"""
         self._store[(str(self._entity_key(record)), str(self._slot_key(record)))] = (
             self._summary(record)
         )
         return True
+
+    async def on_accepted(self, record: RecordT) -> bool:
+        """向后兼容别名：等价 on_overwrite_accepted。"""
+        return await self.on_overwrite_accepted(record)
 
     async def on_persisted(self, record: RecordT) -> None:
         """落库成功后的权威摘要刷新（幂等）。"""

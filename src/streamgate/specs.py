@@ -27,7 +27,8 @@ IngestRecordT = TypeVar("IngestRecordT", bound=BaseModel)
 @dataclass
 class IngestBinding(Generic[IngestRecordT]):
     """接收侧机制绑定：使用方完成 Schema 校验后，网关执行
-    背压 → 准入 → Kafka 发送 → on_accepted 编排。
+    背压 → 准入 → Kafka 发送 → 发送结果钩子（on_send_success/on_send_failed/
+    on_overwrite_accepted）编排。
 
     路由/URL/鉴权/OpenAPI/响应模型等 HTTP 呈现职责归使用方适配层，
     本声明只承载机制所需的策略钩子与错误码契约。

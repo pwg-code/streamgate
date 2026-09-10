@@ -11,8 +11,18 @@ class NoAdmission(Generic[RecordT]):
     async def admit(self, record: RecordT, *, overwrite: bool = False) -> Decision:
         return Decision.allow()
 
-    async def on_accepted(self, record: RecordT) -> bool:
+    async def on_send_success(self, record: RecordT) -> None:
+        return None
+
+    async def on_send_failed(self, record: RecordT) -> None:
+        return None
+
+    async def on_overwrite_accepted(self, record: RecordT) -> bool:
         return True
+
+    async def on_accepted(self, record: RecordT) -> bool:
+        """向后兼容别名：等价 on_overwrite_accepted。"""
+        return await self.on_overwrite_accepted(record)
 
     async def on_persisted(self, record: RecordT) -> None:
         return None

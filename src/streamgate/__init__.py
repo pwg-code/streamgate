@@ -79,7 +79,7 @@ from streamgate.specs import ConsumeSpec, IngestBinding, IngestRecordT
 from streamgate.transport.codec import JsonEnvelopeCodec
 from streamgate.transport.kafka import KafkaConsumerService
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "AdmissionPolicy",

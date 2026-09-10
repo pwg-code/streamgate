@@ -3,8 +3,9 @@
 协议适配层：entity+slot 原子占位（Lua）、idle-GC TTL、
 空实体哨兵、fail-closed、overwrite 预检；TTL/前缀/降级开关/错误码全参数化。
 
-框架保证调用时序：admit → (Kafka 发送) → on_accepted；消费侧
-write 成功 → on_persisted（准入与消费侧的唯一耦合点）。
+框架保证调用时序：admit → (Kafka 发送) → on_send_success（每次成功，通知型）/
+on_send_failed（每次失败，默认保留占位 TTL 自愈）→ on_overwrite_accepted（仅
+overwrite 路径）；消费侧 write 成功 → on_persisted（准入与消费侧的唯一耦合点）。
 """
 
 import asyncio
@@ -197,7 +198,16 @@ class RedisExistenceAdmission(Generic[RecordT]):
             return Decision.allow()
         return result
 
-    async def on_accepted(self, record: RecordT) -> bool:
+    async def on_send_success(self, record: RecordT) -> None:
+        """通知型钩子：占位已在 admit 原子写入，无需动作。"""
+        return None
+
+    async def on_send_failed(self, record: RecordT) -> None:
+        """默认保留占位（TTL 过后冷路径回源自愈）；需"失败立即可重发"可在此
+        删除 existence key 的 field（自担模糊失败重复风险）。"""
+        return None
+
+    async def on_overwrite_accepted(self, record: RecordT) -> bool:
         """overwrite 摘要写：失败重试 1 次；仍失败 ERROR（供告警删 key）并返回 False。"""
         entity = str(self._entity_key(record))
         slot = str(self._slot_key(record))
@@ -214,6 +224,10 @@ class RedisExistenceAdmission(Generic[RecordT]):
                         error=str(e),
                     )
         return False
+
+    async def on_accepted(self, record: RecordT) -> bool:
+        """向后兼容别名：等价 on_overwrite_accepted。"""
+        return await self.on_overwrite_accepted(record)
 
     async def on_persisted(self, record: RecordT) -> None:
         """落库成功 → 提交 offset 前的权威缓存刷新（失败 WARN 不影响提交）。"""

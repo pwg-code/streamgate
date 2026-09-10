@@ -97,9 +97,21 @@ class AdmissionPolicy(Protocol[RecordT]):
         overwrite=True 时策略应跳过唯一性判定（409 确认后的完整重发）。"""
         ...
 
-    async def on_accepted(self, record: RecordT) -> bool:
-        """Kafka 发送成功后：占位/摘要写（失败语义由实现自定）。
-        返回 False 表示"缓存未反映本次记录"（映射到 cache_updated=false）。"""
+    async def on_send_success(self, record: RecordT) -> None:
+        """每次 Kafka 发送成功（broker ack）后调用（含 overwrite 路径；通知型）。
+        非 overwrite 路径占位已在 admit 写入，默认无需动作；实现可做缓存续期等。"""
+        ...
+
+    async def on_send_failed(self, record: RecordT) -> None:
+        """Kafka 发送失败后调用（此时占位可能已写入）。
+        框架默认语义是保留占位（防模糊失败重复，靠 TTL/回源自愈）；
+        实现可在此释放占位换取"立即可重发"，自担重复风险。"""
+        ...
+
+    async def on_overwrite_accepted(self, record: RecordT) -> bool:
+        """仅 overwrite 路径、Kafka 成功后：幂等摘要写（失败语义由实现自定）。
+        返回 False 表示"缓存未反映本次记录"（映射到 cache_updated=false）。
+        兼容：旧版策略只实现 on_accepted 时，框架按本钩子语义回退调用。"""
         ...
 
     async def on_persisted(self, record: RecordT) -> None:

@@ -1,4 +1,4 @@
-"""IngestGateway：传输无关的接收编排内核（背压 → 准入 → 发送 → on_accepted）。
+"""IngestGateway：传输无关的接收编排内核（背压 → 准入 → 发送 → 发送结果钩子）。
 
 HTTP 鉴权/路由/OpenAPI 等呈现职责归使用方适配层：process() 返回传输无关的
 IngestOutcome，不抛 HTTP 异常、不构造 Response。日志事件名与字段为稳定观测
@@ -6,8 +6,9 @@ IngestOutcome，不抛 HTTP 异常、不构造 Response。日志事件名与字�
 """
 
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Generic
+from typing import Generic, cast
 
 from streamgate.config import BackpressureConfig, KafkaConfig, MetricsConfig
 from streamgate.ingest.admission.in_memory import InMemoryAdmission
@@ -35,6 +36,16 @@ from streamgate.transport.codec import JsonEnvelopeCodec
 
 def _iso_z(dt: datetime) -> str:
     return dt.isoformat().replace("+00:00", "Z")
+
+
+def _optional_hook(
+    admission: AdmissionPolicy[IngestRecordT], name: str
+) -> Callable[[IngestRecordT], Awaitable[object]] | None:
+    """按名解析可选钩子：旧版策略缺新钩子时返回 None（向后兼容）。"""
+    candidate: object | None = getattr(admission, name, None)
+    if not callable(candidate):
+        return None
+    return cast("Callable[[IngestRecordT], Awaitable[object]]", candidate)
 
 
 class IngestGateway(Generic[IngestRecordT]):
@@ -141,7 +152,7 @@ class IngestGateway(Generic[IngestRecordT]):
         overwrite: bool | None = None,
         source: str = "unknown",
     ) -> IngestOutcome:
-        """接收单条记录：背压 → 准入 → Kafka 发送 → on_accepted。
+        """接收单条记录：背压 → 准入 → Kafka 发送 → 发送结果钩子。
 
         overwrite=None 时按 binding.is_overwrite(record) 解析。
         未 start() 直接抛 RuntimeError（装配错误，非运行时降级）。
@@ -247,9 +258,9 @@ class IngestGateway(Generic[IngestRecordT]):
         source: str,
         log_ctx: JsonObject,
     ) -> IngestOutcome:
-        """Kafka 发送（失败 502；占位保留自愈）→ overwrite 摘要写 → 成功日志。"""
+        """Kafka 发送 → 失败 502（on_send_failed，默认占位保留自愈）→ 成功钩子
+        → overwrite 摘要写 → 成功日志。"""
         binding = self.binding
-        producer = self._require_producer()
         entity = str(binding.entity_key(record))
         slot = str(binding.slot_key(record))
         key = (
@@ -263,29 +274,16 @@ class IngestGateway(Generic[IngestRecordT]):
             _iso_z(received_at),
             source,
         )
-        t0 = time.monotonic()
-        try:
-            await producer.send(key=key, message=message)
-        except Exception as e:
-            self._metrics.produce_failure.record()
-            logger.error(
-                "kafka_send_failed",
-                **log_ctx,
-                error=str(e),
-                source=source,
-                error_code=binding.kafka_unavailable_code,
-            )
+        if not await self._produce(
+            record, key=key, message=message, log_ctx=log_ctx, source=source
+        ):
             return IngestOutcome.kafka_unavailable(
                 error_code=binding.kafka_unavailable_code,
                 detail=binding.kafka_unavailable_detail,
             )
-        self._metrics.produce_success.record()
-        self._metrics.produce_latency.record_latency(
-            (time.monotonic() - t0) * 1000.0  # send 调用到 broker 确认耗时（毫秒）
+        cache_updated = (
+            await self._overwrite_summary_write(record) if overwrite else True
         )
-
-        # ---- overwrite 路径：Kafka 成功后幂等摘要写（实现内自定重试）----
-        cache_updated = await self._admission.on_accepted(record) if overwrite else True
 
         logger.info(
             "ingest_request",
@@ -299,6 +297,68 @@ class IngestGateway(Generic[IngestRecordT]):
             overwrite=overwrite,
         )
         return IngestOutcome.accepted(received_at, cache_updated=cache_updated)
+
+    async def _produce(
+        self,
+        record: IngestRecordT,
+        *,
+        key: str,
+        message: JsonObject,
+        log_ctx: JsonObject,
+        source: str,
+    ) -> bool:
+        """Kafka 发送 + 指标 + 发送结果钩子。False = 失败（已记录日志与钩子）。"""
+        producer = self._require_producer()
+        t0 = time.monotonic()
+        try:
+            await producer.send(key=key, message=message)
+        except Exception as e:
+            self._metrics.produce_failure.record()
+            logger.error(
+                "kafka_send_failed",
+                **log_ctx,
+                error=str(e),
+                source=source,
+                error_code=self.binding.kafka_unavailable_code,
+            )
+            await self._notify_send_failed(record)
+            return False
+        self._metrics.produce_success.record()
+        self._metrics.produce_latency.record_latency(
+            (time.monotonic() - t0) * 1000.0  # send 调用到 broker 确认耗时（毫秒）
+        )
+        await self._notify_send_success(record)
+        return True
+
+    async def _notify_send_success(self, record: IngestRecordT) -> None:
+        """每次发送成功的通知钩子（best-effort：钩子异常不影响已成功的请求）。"""
+        hook = _optional_hook(self._admission, "on_send_success")
+        if hook is None:
+            return
+        try:
+            await hook(record)
+        except Exception as e:
+            logger.warning("admission_send_success_hook_failed", error=str(e))
+
+    async def _notify_send_failed(self, record: IngestRecordT) -> None:
+        """发送失败钩子（best-effort：默认保留占位，实现可释放换取立即重发）。"""
+        hook = _optional_hook(self._admission, "on_send_failed")
+        if hook is None:
+            return
+        try:
+            await hook(record)
+        except Exception as e:
+            logger.warning("admission_send_failed_hook_failed", error=str(e))
+
+    async def _overwrite_summary_write(self, record: IngestRecordT) -> bool:
+        """overwrite 路径摘要写；旧版策略回退 on_accepted（向后兼容）。"""
+        hook = _optional_hook(self._admission, "on_overwrite_accepted")
+        if hook is None:
+            legacy = _optional_hook(self._admission, "on_accepted")
+            if legacy is None:
+                return True
+            return bool(await legacy(record))
+        return bool(await hook(record))
 
     def _require_producer(self) -> KafkaProducerService:
         """start() 完成前不可达；与 KafkaProducerService 未启动语义一致。"""
