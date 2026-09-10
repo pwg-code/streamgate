@@ -37,14 +37,14 @@ KAFKA__BOOTSTRAP_SERVERS=localhost:29092 python produce.py
 ## Cold-entity backfill (optional)
 
 `RedisExistenceAdmission(backfill=...)` accepts any `BackfillSource` — use
-`SqlBackfill` from `streamgate.contrib.sql_sink` (extra `[sql]`). With a
+`SqlBackfill` from `streamgate.contrib.sql_upsert` (extra `[sql]`). With a
 backfill wired, cold entities are loaded from the database, fully cached into
 Redis, and 409s stay correct even after Redis flushes (TTL idle-GC).
 
 ## Wire the consumer side
 
 Pair this with any consumer example: `examples/pure_pipeline/consume.py`
-(zero-dep) or `examples/sqlite_sink/consume.py` (SQL upsert). To keep the
+(zero-dep) or `examples/sqlite_upsert/consume.py` (SQL upsert). To keep the
 uniqueness contract authoritative, inject the same admission policy as
-`ConsumeSpec.persist_policy` — the consumer then refreshes Redis summaries
-after each successful write (`on_persisted`).
+`ConsumerOptions(persist_hook=...)` — the consumer then refreshes Redis
+summaries after each successful batch (`on_persisted`).

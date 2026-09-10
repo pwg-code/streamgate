@@ -57,19 +57,19 @@ _INFRA_KEYWORDS: tuple[str, ...] = (
 
 
 class SQLAlchemyErrorClassifier:
-    """SQLAlchemy 写侧异常分类。误判方向是安全方向的：
-    误判 infra→poison 走二分，探针失败自然回落 paused；
+    """SQLAlchemy 出口异常分类。误判方向是安全方向的：
+    误判 infra→poison 走定位隔离，对照探针失败自然回落 paused；
     误判 poison→infra 会 paused 死循环，由积压告警兜底。
     """
 
     def classify(self, exc: Exception, attempt: int) -> ErrorKind:
-        # 1. 事务/池超时：writer.write 的 wait_for 兜底会再抛 asyncio.TimeoutError
+        # 1. 事务/池超时：出口批处理的 wait_for 兜底会再抛 asyncio.TimeoutError
         if isinstance(exc, asyncio.TimeoutError):
             return ErrorKind.RETRY
         # SQLAlchemy 连接池耗尽（sqlalchemy.exc.TimeoutError，与 asyncio 的同名不同类）
         if isinstance(exc, SQLAlchemyTimeoutError):
             return ErrorKind.RETRY
-        # Kafka 侧瞬态（理论不出现在写侧，防御性归 RETRY）
+        # Kafka 侧瞬态（理论不出现在 DB 出口，防御性归 RETRY）
         if isinstance(exc, KafkaError):
             return ErrorKind.RETRY
 

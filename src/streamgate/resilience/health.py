@@ -1,6 +1,6 @@
 """健康快照契约：数据归框架（collect_* 纯函数），暴露端点归使用方。
 
-/health 的响应结构为公共契约（kafka/db/redis/quarantined_count/backlog）；
+/health 的响应结构为公共契约（kafka/output/redis/quarantined_count/backlog）；
 本模块不构建任何 HTTP 工件，使用方自行选择暴露方式（路由/文件/TCP）。
 """
 
@@ -55,10 +55,10 @@ class _ConsumerRuntimeLike(Protocol):
     def consumer(self) -> _ConsumerLike | None: ...
 
     @property
-    def writer(self) -> object | None: ...
+    def handler(self) -> object: ...
 
     @property
-    def cache(self) -> object | None: ...
+    def health_probe(self) -> object | None: ...
 
     @property
     def paused(self) -> bool: ...
@@ -140,9 +140,10 @@ class IngestHealthResponse(BaseModel):
 class ConsumerHealthResponse(BaseModel):
     status: str = Field(description="healthy / degraded / stopped")
     kafka: str = Field(description="connected / disconnected")
-    database: str | None = Field(
+    output: str | None = Field(
         default=None,
-        description="DB sink 连接状态；未接线 sink（on_record 模式）时为 null",
+        description="出口组件连接状态：connected / disconnected。"
+        "出口无可观测载体（普通函数 handler）视为 connected；停机时为 null",
     )
     redis: str | None = Field(
         default=None,
@@ -153,7 +154,7 @@ class ConsumerHealthResponse(BaseModel):
     lag: int = Field(description="Kafka 消费延迟")
     backlog_age_seconds: float | None = Field(
         default=None,
-        description="最老未落地消息积压时长（秒）；无积压/未知时为 None",
+        description="最老未处理消息积压时长（秒）；无积压/未知时为 None",
     )
     quarantined_count: int = Field(
         description="进程生命周期内累计隔离至 DLQ 的坏数据条数",
@@ -162,25 +163,25 @@ class ConsumerHealthResponse(BaseModel):
         default=0.0,
         description="近窗口消费速率（条/秒，毒丸/未知类型不计入）",
     )
-    sink_write_rate: float = Field(
+    handle_rate: float = Field(
         default=0.0,
-        description="近窗口 writer 写入成功速率（条/秒）",
+        description="近窗口处理成功速率（条/秒）",
     )
-    sink_write_failure_rate: float = Field(
+    handle_failure_rate: float = Field(
         default=0.0,
-        description="近窗口 writer 写入失败速率（条/秒）",
+        description="近窗口处理失败速率（条/秒）",
     )
     retry_rate: float = Field(
         default=0.0,
-        description="近窗口写入重试速率（次/秒，瞬升即写库异常告警信号）",
+        description="近窗口处理重试速率（次/秒，瞬升即出口异常告警信号）",
     )
-    sink_write_latency_ms_avg: float = Field(
+    handle_latency_ms_avg: float = Field(
         default=0.0,
-        description="近窗口单批写入耗时均值（毫秒，按成功写计）",
+        description="近窗口单批处理耗时均值（毫秒，按成功批计）",
     )
-    sink_write_latency_ms_max: float = Field(
+    handle_latency_ms_max: float = Field(
         default=0.0,
-        description="近窗口单批写入耗时最大值（毫秒）",
+        description="近窗口单批处理耗时最大值（毫秒）",
     )
 
 
@@ -200,7 +201,7 @@ async def _probe_producer(
 
 
 async def _probe_component(component: object | None) -> bool | None:
-    """组件健康探测：None=组件未接线；未实现 check_health 的 sink 视为健康。"""
+    """组件健康探测：None=组件未接线；未实现 check_health 的组件视为健康。"""
     if component is None:
         return None
     check = getattr(component, "check_health", None)
@@ -294,12 +295,12 @@ async def _absent() -> bool:
 
 
 def _consumer_status(
-    paused: bool, kafka_ok: bool, db_ok: bool | None, redis_ok: bool | None
+    paused: bool, kafka_ok: bool, output_ok: bool | None, redis_ok: bool | None
 ) -> str:
     """状态判定：未接线组件（None）不参与判定；paused 恒 degraded。"""
     if paused:
         return "degraded"
-    if not kafka_ok or db_ok is False or redis_ok is False:
+    if not kafka_ok or output_ok is False or redis_ok is False:
         return "degraded"
     return "healthy"
 
@@ -313,14 +314,14 @@ def _state_str(ok: bool | None) -> str | None:
 async def collect_consumer_health(
     runtime: _ConsumerRuntimeLike,
 ) -> ConsumerHealthResponse:
-    """consumer 侧健康快照：三子检查并发（DB 黑洞时快照不能挂死）。
+    """consumer 侧健康快照：三子检查并发（出口组件黑洞时快照不能挂死）。
 
     速率字段读取 runtime.metrics（未接线/停机态取模型默认 0.0）；
     读取只读不重置，连续拉取数值一致。
     """
-    kafka_ok, db_ok, redis_ok = await asyncio.gather(
-        _probe_kafka(runtime), _probe_component(runtime.writer),
-        _probe_component(runtime.cache),
+    kafka_ok, output_ok, redis_ok = await asyncio.gather(
+        _probe_kafka(runtime), _probe_component(runtime.handler),
+        _probe_component(runtime.health_probe),
     )
     backlog_age_seconds = (
         time.time() - runtime.backlog_oldest_ts
@@ -329,9 +330,9 @@ async def collect_consumer_health(
     )
     m = runtime.metrics
     return ConsumerHealthResponse(
-        status=_consumer_status(runtime.paused, kafka_ok, db_ok, redis_ok),
+        status=_consumer_status(runtime.paused, kafka_ok, output_ok, redis_ok),
         kafka="connected" if kafka_ok else "disconnected",
-        database=_state_str(db_ok),
+        output=_state_str(output_ok),
         redis=_state_str(redis_ok),
         last_commit_at=runtime.last_commit_at,
         pending_count=runtime.pending_count,
@@ -339,16 +340,16 @@ async def collect_consumer_health(
         backlog_age_seconds=backlog_age_seconds,
         quarantined_count=runtime.quarantined_count,
         consume_rate=m.consumed.rate_per_second() if m is not None else 0.0,
-        sink_write_rate=m.sink_written.rate_per_second() if m is not None else 0.0,
-        sink_write_failure_rate=(
-            m.sink_write_failed.rate_per_second() if m is not None else 0.0
+        handle_rate=m.handled.rate_per_second() if m is not None else 0.0,
+        handle_failure_rate=(
+            m.handle_failed.rate_per_second() if m is not None else 0.0
         ),
         retry_rate=m.retries.rate_per_second() if m is not None else 0.0,
-        sink_write_latency_ms_avg=(
-            m.sink_write_latency.latency_avg_ms() if m is not None else 0.0
+        handle_latency_ms_avg=(
+            m.handle_latency.latency_avg_ms() if m is not None else 0.0
         ),
-        sink_write_latency_ms_max=(
-            m.sink_write_latency.latency_max_ms() if m is not None else 0.0
+        handle_latency_ms_max=(
+            m.handle_latency.latency_max_ms() if m is not None else 0.0
         ),
     )
 

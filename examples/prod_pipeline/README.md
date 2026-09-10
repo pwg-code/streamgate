@@ -1,4 +1,4 @@
-# prod_pipeline — production topology: Redis admission + HTTP-probe backpressure + MSSQL sink
+# prod_pipeline — production topology: Redis admission + HTTP-probe backpressure + MSSQL outlet
 
 The full production wiring in one runnable demo. Every strategy comes from
 `streamgate.contrib` — install once, import everywhere:
@@ -9,8 +9,9 @@ The full production wiring in one runnable demo. Every strategy comes from
 - **HTTP probe backpressure** (`contrib.http_probe`, extra `[http]`) — ingest
   rejects when the consumer reports backlog or the health endpoint is
   unreachable (fail-closed), with trip/recover hysteresis.
-- **MSSQL idempotent sink** (`contrib.mssql_sink`, extra `[sql]`) —
-  `MERGE` + HOLDLOCK upsert with the SQL Server error-number classifier.
+- **MSSQL idempotent outlet** (`contrib.mssql_upsert`, extra `[sql]`) —
+  `MssqlConsumer` factory: `MERGE` + HOLDLOCK upsert with the SQL Server
+  error-number classifier, batch handler + single-record probe pre-wired.
   The dialect auto-selects from the connection string, so the same wiring
   runs on SQLite for local smoke.
 
@@ -19,9 +20,9 @@ The full production wiring in one runnable demo. Every strategy comes from
 | Module | Contents |
 |--------|----------|
 | `produce.py` | ingest side: `RedisExistenceAdmission` + `HttpProbeSignal` injection |
-| `consume.py` | consumer side: `UpsertWriter` + `SQLAlchemyErrorClassifier` + health endpoint |
-| `health_server.py` | demo-grade stdlib `GET /health` serving `worker.health_snapshot()` — swap in your web framework for production |
-| `models.py` | ingress schema + landing table (`orders`) |
+| `consume.py` | consumer side: `MssqlConsumer` factory + health endpoint |
+| `health_server.py` | demo-grade stdlib `GET /health` serving `consumer.health_snapshot()` — swap in your web framework for production |
+| `models.py` | ingress schema + storage table (`orders`) |
 
 ## Run
 
@@ -53,11 +54,11 @@ KAFKA__BOOTSTRAP_SERVERS=localhost:9092 python produce.py
 ## Notes
 
 - **Cold-entity backfill (optional):** pass `backfill=SqlBackfill(...)`
-  (from `contrib.sql_sink`) to `RedisExistenceAdmission` so cache misses are
+  (from `contrib.sql_upsert`) to `RedisExistenceAdmission` so cache misses are
   verified against the database instead of rejected (fail-closed default).
 - **Consumer-side authoritative refresh:** inject the same admission policy
-  as `ConsumeSpec.persist_policy` so Redis summaries are refreshed after each
-  successful write — see
+  as `ConsumerOptions(persist_hook=...)` so Redis summaries are refreshed
+  after each successful batch — see
   [`examples/redis_admission/README.md`](../redis_admission/README.md).
 - **Schema management:** the demo creates tables at startup (checkfirst);
   production uses your migration tool.

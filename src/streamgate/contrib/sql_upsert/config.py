@@ -1,4 +1,4 @@
-"""SQL 落库配置（streamgate.contrib.sql_sink）。
+"""SQL upsert 配置（streamgate.contrib.sql_upsert）。
 
 DB 是使用方的基础设施：连接配置由使用方自带，不进框架核心。
 生产按需扩充（凭据走环境变量）。
@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 
 class DbConfig(BaseModel):
-    """落库配置：连接串必填（缺失即装配失败，含修复指引）。"""
+    """DB 连接配置：连接串必填（缺失即装配失败，含修复指引）。"""
 
     connection_string: str | None = None
     echo: bool = False

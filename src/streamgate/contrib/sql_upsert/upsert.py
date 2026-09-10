@@ -1,8 +1,9 @@
-"""Upsert 声明 + 幂等 upsert 编排（RecordWriter 协议的 SQL 实现）。
+"""Upsert 声明 + 幂等 upsert 编排（SQL 出口原语）。
 
-`Upsert`（声明）与 `UpsertWriter`（RecordWriter 协议实现）：多目标
-投影/校验/去重 + 方言 upsert（sqlite ON CONFLICT / mssql MERGE），
-单事务批量写。
+`Upsert`（声明）：多目标投影/校验/去重 + 方言 upsert（sqlite ON CONFLICT /
+mssql MERGE），单事务批量处理。
+`upsert_outlet`（原语）：返回 (批处理 handler, 单条探针 probe)，
+供 Consumer 直接接线，或经 sqlite_upsert/mssql_upsert 预装配工厂使用。
 """
 
 import asyncio
@@ -14,20 +15,24 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlmodel import SQLModel
 
 from streamgate import logger
-from streamgate.contrib.sql_sink._dialects import mssql as mssql_dialect
-from streamgate.contrib.sql_sink._dialects import sqlite as sqlite_dialect
-from streamgate.contrib.sql_sink._dialects.mssql import mssql_cast_types
-from streamgate.contrib.sql_sink.config import DbConfig
-from streamgate.protocols import JsonObject, WriteResult
+from streamgate.contrib.sql_upsert._dialects import mssql as mssql_dialect
+from streamgate.contrib.sql_upsert._dialects import sqlite as sqlite_dialect
+from streamgate.contrib.sql_upsert._dialects.mssql import mssql_cast_types
+from streamgate.contrib.sql_upsert.config import DbConfig
+from streamgate.contrib.sql_upsert.engines import (
+    async_session_factory,
+    create_write_engine,
+)
+from streamgate.protocols import BatchHandler, ConsumeContext, JsonObject, Probe
 
 # 行级变换钩子类型（Upsert.prepare 参数）
 RowTransform = Callable[[JsonObject], JsonObject]
 
 
 class Upsert:
-    """一个落库目标：模型 + 幂等键（+ 可选字段排除/行级变换）。
+    """一个 upsert 目标：模型 + 幂等键（+ 可选字段排除/行级变换）。
 
-    name 用于写入计数与 batch_write_success 日志字段（f"{name}_count"）；
+    name 用于处理计数与日志字段（f"{name}_count"）；
     prepare 为行级策略钩子（如时区归一、字段清洗），在字段投影前执行；
     exclude 为不参与 INSERT/UPDATE 的列（如 IDENTITY 自增主键）。
     """
@@ -87,14 +92,14 @@ def _project_rows(spec: Upsert, records: list[JsonObject]) -> list[JsonObject]:
     return rows
 
 
-async def _write_single_target(
+async def _upsert_single_target(
     session: AsyncSession,
     spec: Upsert,
     records: list[JsonObject],
     *,
     is_sqlite: bool,
 ) -> int:
-    """把投影后的记录写入单个 upsert 目标，返回写入行数。"""
+    """把投影后的记录写入单个 upsert 目标，返回处理行数。"""
     rows = mssql_dialect.dedup_rows(_project_rows(spec, records), spec.keys)
     if not rows:
         return 0
@@ -136,14 +141,18 @@ async def execute_upserts(
     """
     counts: dict[str, int] = {}
     for spec in upserts:
-        counts[spec.name] = await _write_single_target(
+        counts[spec.name] = await _upsert_single_target(
             session, spec, records, is_sqlite=is_sqlite
         )
     return counts
 
 
-class UpsertWriter:
-    """RecordWriter 实现：幂等 upsert 编排（含启动建表/健康探测/关闭）。"""
+class _UpsertOutlet:
+    """SQL upsert 出口载体：批处理 handler（含生命周期与健康探测）。
+
+    鸭子类型托管：start()/close() 由 Consumer 框架自动调用；
+    check_health() 被健康快照观测为 output 字段。
+    """
 
     def __init__(
         self,
@@ -158,31 +167,31 @@ class UpsertWriter:
         self._upserts = upserts
 
     async def start(self) -> None:
-        """建表（dev sqlite）+ 启动期数据库连接探测（RecordWriter.start 实现）。
+        """建表（dev sqlite）+ 启动期数据库连接探测。
 
         engine 与 session factory 由装配点注入。连接成功 INFO
         `db_connected`，失败 ERROR `db_connection_failed`（不抛出；消费循环
-        与健康检查以真实状态运行，DB 恢复后自动续写）。
+        与健康检查以真实状态运行，DB 恢复后自动续接）。
         """
-        engine = self._config.dialect
+        engine_name = self._config.dialect
         url = self._config.redacted_connection_string
         try:
-            if engine == "sqlite":
+            if engine_name == "sqlite":
                 assert self._engine is not None
                 async with self._engine.begin() as conn:
                     await conn.execute(text("PRAGMA journal_mode=WAL"))
                     await conn.execute(text("PRAGMA busy_timeout=5000"))
                     await conn.execute(text("PRAGMA foreign_keys=ON"))
                     await conn.run_sync(_create_tables)
-                logger.info("db_initialized", engine=engine, url=url)
+                logger.info("db_initialized", engine=engine_name, url=url)
             # 统一启动期探测（mssql 分支建连校验；sqlite 建表即已连，再探一次成本可忽略）
             ok, err = await self.check_health_detail()
             if ok:
-                logger.info("db_connected", engine=engine, url=url)
+                logger.info("db_connected", engine=engine_name, url=url)
             else:
-                logger.error("db_connection_failed", engine=engine, url=url, error=err)
+                logger.error("db_connection_failed", engine=engine_name, url=url, error=err)
         except Exception as e:
-            logger.error("db_connection_failed", engine=engine, url=url, error=str(e))
+            logger.error("db_connection_failed", engine=engine_name, url=url, error=str(e))
 
     async def close(self) -> None:
         if self._engine is None:
@@ -212,8 +221,18 @@ class UpsertWriter:
             logger.debug("db_health_check_failed", error=str(e))
             return False, str(e)
 
-    async def write(self, batch: list[JsonObject]) -> WriteResult:
-        """批量写入：prepare/投影 + 多目标 upsert，单事务。
+    async def __call__(
+        self, batch: list[JsonObject], _context: ConsumeContext
+    ) -> None:
+        """BatchHandler 契约：整批单事务 upsert；失败以异常表达（框架分类处置）。"""
+        counts = await self.write_batch(batch)
+        logger.debug(
+            "db_upsert_completed",
+            **{f"{name}_count": count for name, count in counts.items()},
+        )
+
+    async def write_batch(self, batch: list[JsonObject]) -> dict[str, int]:
+        """批量 upsert：prepare/投影 + 多目标，单事务。返回 {目标: 行数} 计数。
 
         整个事务段（含 COMMIT）被 wait_for 包裹 -- MERGE 的 HOLDLOCK
         锁等待常发生在 COMMIT 阶段，只包 execute 不够。不变式：驱动超时
@@ -222,35 +241,50 @@ class UpsertWriter:
         既有重试→退避→paused 自愈分支。
         """
         if not batch:
-            return WriteResult(counts={})
+            return {}
         if self._session_factory is None:
-            raise RuntimeError("UpsertWriter not initialized, call start() first")
+            raise RuntimeError("upsert outlet not initialized, call start() first")
 
         try:
-            counts = await asyncio.wait_for(
-                self._write_tx(batch),
+            return await asyncio.wait_for(
+                self._upsert_tx(batch),
                 timeout=self._config.write_wait_seconds,
             )
         except asyncio.TimeoutError:
             logger.error(
-                "write_batch_timeout",
+                "upsert_batch_timeout",
                 batch_size=len(batch),
                 wait_seconds=self._config.write_wait_seconds,
             )
             raise
-        return WriteResult(counts=counts)
 
-    async def _write_tx(self, batch: list[JsonObject]) -> dict[str, int]:
-        """单事务批量写入（从 write 抽出，供 wait_for 包裹）。"""
+    async def _upsert_tx(self, batch: list[JsonObject]) -> dict[str, int]:
+        """单事务批量 upsert（从 write_batch 抽出，供 wait_for 包裹）。"""
         factory = self._session_factory
         if factory is None:
-            raise RuntimeError("UpsertWriter not initialized, call start() first")
+            raise RuntimeError("upsert outlet not initialized, call start() first")
         async with factory() as session:
             async with session.begin():
-                counts = await execute_upserts(
+                return await execute_upserts(
                     session, self._upserts, batch, is_sqlite=self._config.dialect == "sqlite"
                 )
-        return counts
 
 
-__all__ = ["Upsert", "UpsertWriter", "execute_upserts"]
+def upsert_outlet(db: DbConfig, upserts: list[Upsert]) -> tuple[BatchHandler, Probe]:
+    """SQL upsert 出口原语：返回 (批处理 handler, 单条探针 probe)。
+
+    - handler：整批单事务幂等 upsert（BatchHandler 契约；载体对象同时
+      实现 start()/close()/check_health()，由 Consumer 框架鸭子类型托管）；
+    - probe：单条 upsert（与 handler 幂等同构），供 POISON 批精确定位。
+    """
+    engine = create_write_engine(db)
+    factory = async_session_factory(engine)
+    outlet = _UpsertOutlet(db, engine, factory, upserts)
+
+    async def probe(record: JsonObject) -> None:
+        await outlet.write_batch([record])
+
+    return outlet, probe
+
+
+__all__ = ["Upsert", "execute_upserts", "upsert_outlet"]

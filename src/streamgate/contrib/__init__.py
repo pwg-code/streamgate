@@ -7,7 +7,7 @@
 子包与 extras 对照（缺依赖时 import 会给出安装指引）：
 - redis_admission：Redis 唯一性准入（entity+slot 原子占位 / 冷回源 / 空实体哨兵）
     → pip install streamgate[redis]
-- sql_sink / sqlite_sink / mssql_sink：SQL 幂等 upsert 落地（基座 + 双方言入口）
+- sql_upsert / sqlite_upsert / mssql_upsert：SQL 幂等 upsert 出口（基座 + 双方言预装配工厂）
     → pip install streamgate[sql]
 - http_probe：HTTP 探活背压信号（磁滞状态机，双进程拓扑）
     → pip install streamgate[http]

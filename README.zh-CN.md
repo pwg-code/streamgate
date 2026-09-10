@@ -7,10 +7,10 @@
 
 [English](README.md) | 中文
 
-**streamgate 是一条"带闸门的数据流水线"**：数据从门口进来（接收），穿过 Kafka 管道（投递），最后落到你想放的任何地方（存储）。
+**streamgate 是一条"带闸门的数据流水线"**：数据从门口进来（接收），穿过 Kafka 管道（投递），从另一头的出口出去（处理）——出口就是一行 `Consumer(bootstrap_servers, topic, group_id, handler)`。
 
 ```
-你的程序 ──► IngestGateway（进） ──► Kafka（管道） ──► ConsumerWorker（出） ──► 你的存储
+你的程序 ──► IngestGateway（进） ──► Kafka（管道） ──► Consumer（出） ──► 你的 handler
               查重、限流、背压                        批量缓冲、重试、坏数据隔离
 ```
 
@@ -20,13 +20,13 @@
 
 ## 为什么选它
 
-- **机制归框架，策略归你。** 查重流程、重试、限流、断线重连、优雅停机这些"脏活累活"框架全包；你只管业务语义（主键是什么、摘要放什么）和存储选型。
-- **查重不绑定存储。** 框架提供查重的"流程编排"（存在性判定 → 原子占位 → 冷回源 → 消费后刷新），至于用 Redis、进程内字典还是别的什么来存，由你注入。内置零依赖实现开箱即用；生产级 Redis 实现已收录为 `streamgate.contrib.redis_admission`（装 `[redis]` extra 即用）。
-- **一个写入钩子，接任何存储。** MySQL、ES、另一个服务、一个文件……实现 `RecordWriter` 接口注入即可。批量缓冲、失败重试、坏数据二分隔离这些框架替你兜底。
-- **错误分类也是钩子。** "连接超时该重试"还是"数据脏了该隔离"，只有懂你存储的人知道。注入一个分类器即可；不注入也有安全的默认行为（不会丢数据）。
+- **机制归框架，策略归你。** 查重流程、重试、限流、断线重连、优雅停机这些"脏活累活"框架全包；你只管业务语义（主键是什么、摘要放什么）和数据去哪——入库、实时分析、转发、告警，都只是 handler 里那几行代码的区别。
+- **查重不绑定存储。** 框架提供查重的"流程编排"（存在性判定 → 原子占位 → 冷回源 → 处理后刷新），至于用 Redis、进程内字典还是别的什么来存，由你注入。内置零依赖实现开箱即用；生产级 Redis 实现已收录为 `streamgate.contrib.redis_admission`（装 `[redis]` extra 即用）。
+- **一个出口契约，接任何去处。** `Consumer(..., handler=handle_batch)` 就是全部故事：正常返回 = 整批处理完成（框架提交位点）；抛异常 = 按分类处置（重试退避 / 毒批隔离 / 致命停机）。单条还是批量，只是 `batch_size=1` 和 `batch_size=N` 的区别。SQL upsert 出口已预装配为 `streamgate.contrib.sqlite_upsert` / `mssql_upsert`。
+- **错误分类也是钩子。** "连接超时该重试"还是"数据脏了该隔离"，只有懂你出口的人知道。注入一个分类器即可；不注入也有安全的默认行为（不会丢数据）。
 - **背压带磁滞防抖。** 消费端积压超标自动拒绝接收，回落后自动放行，来回抖动有磁滞带压着。
-- **坏数据不堵管道。** 一条毒消息不会卡死整个分区：二分定位、隔离进死信 topic，好数据继续走。
-- **运维观测长在快照里。** 健康快照自带滑动窗口算好的速率/延迟指标（接收速率、准入冲突、生产成败、入库速率、重试速率、写入耗时 avg/max），现有健康端点直接当监控数据源用——不配 Prometheus 也能看趋势、设告警。
+- **坏数据不堵管道。** 一条毒消息不会卡死整个分区：单条探针逐条定位，坏数据精确隔离进死信 topic，好数据照常处理、位点照常推进。
+- **运维观测长在快照里。** 健康快照自带滑动窗口算好的速率/延迟指标（接收速率、准入冲突、生产成败、处理速率、重试速率、处理耗时 avg/max），现有健康端点直接当监控数据源用——不配 Prometheus 也能看趋势、设告警。
 
 ---
 
@@ -83,20 +83,22 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from streamgate import ConsumeSpec, ConsumerWorker, ConsumerConfig, KafkaConfig
+from streamgate import Consumer
 
-async def handle(records, context):
-    # records 是一批 dict —— 写数据库、写文件、发 HTTP，随你
-    print(f"收到 {len(records)} 条: {records}")
+async def handle(batch, context):
+    # batch 是一批 dict —— 入库、实时分析、转发、告警，随你
+    print(f"收到 {len(batch)} 条: {batch}")
 
 async def main() -> None:
-    spec = ConsumeSpec(on_record=handle, expected_message_type="order")
-    worker = ConsumerWorker(
-        spec,
-        kafka_config=KafkaConfig(bootstrap_servers="localhost:29092", topic="orders"),
-        consumer_config=ConsumerConfig(group_id="my-group"),
+    consumer = Consumer(
+        bootstrap_servers="localhost:29092",  # 数据从哪个集群来
+        topic="orders",                       # 从哪个 topic 读
+        group_id="my-group",                  # 消费组身份（位点归属）
+        handler=handle,                       # 数据到哪去——唯一的出口
+        batch_size=500,                       # 改成 1 即单条实时
+        flush_timeout=5.0,                    # 攒不满时超时也触发
     )
-    await worker.run()   # 阻塞运行；Ctrl+C 优雅停机（自动清空缓冲、提交位点）
+    await consumer.run()   # 阻塞运行；Ctrl+C 优雅停机（自动清空缓冲、提交位点）
 
 asyncio.run(main())
 ```
@@ -108,16 +110,16 @@ asyncio.run(main())
 ## 核心概念，记住三句话
 
 1. **门口（IngestGateway）管"收不收"**：查重、限流都是它的活；
-2. **出口（ConsumerWorker）管"怎么落地"**：批量、重试、死信隔离都是它的活；
-3. **两个"口"之间的一切存储载体都是你的**：实现协议 → 注入 → 完事。
+2. **出口（Consumer）管"怎么处理"**：批量、重试、死信隔离都是它的活；
+3. **两个"口"之外的一切存储载体和业务动作都是你的**：写个 handler → 注入 → 完事。
 
 三个使用层次：
 
 | 层次 | 你用什么 | 适用场景 |
 |------|----------|----------|
-| **0 — 声明式** | `IngestBinding` + `ConsumeSpec`（`sink` 或 `on_record`） | 绝大多数场景：声明消息类型和查重键，注入你的写入器 |
+| **0 — 声明式 / 扁平构造** | `IngestBinding`（进）+ `Consumer(...)` 四个必填项（出） | 绝大多数场景：声明消息类型和查重键，传好出口四项 |
 | **1 — 换组件** | `streamgate.protocols` 里的协议 + 内置零依赖实现 | 替换准入、背压信号、编解码、错误分类器 |
-| **2 — 逃生口** | `ConsumeSpec.on_record` / `ConsumeContext` | 自己处理整批记录，完全不碰 sink 机制 |
+| **2 — 高级项** | `ConsumerOptions` / `DlqOptions` / `RuntimeTuning` | type 校验、单条探针、分类器、联动钩子、DLQ、调优——全可选、全默认 |
 
 协议集中在 `streamgate.protocols`（冻结契约，只增不改）。
 
@@ -125,48 +127,44 @@ asyncio.run(main())
 
 ## 如何拓展
 
-所有拓展都是同一个套路：**实现一个协议类，然后注入**，不需要继承任何框架基类。
+所有拓展都是同一个套路：**实现一个协议（或一个函数），然后注入**，不需要继承任何框架基类。
 
 ### 5 个钩子，按需替换
 
 | 钩子协议 | 管什么 | 什么时候需要自己写 |
 |---|---|---|
-| **RecordWriter** | 数据落到哪 | 最常用！写 MySQL/ES/调接口……都实现它 |
+| **BatchHandler** | 数据到哪去 | 最常用！一个 async 函数就是完整出口 |
 | **AdmissionPolicy** | 门口怎么查重 | 需要多实例共享去重时（如用 Redis） |
-| **ErrorClassifier** | 写失败了算什么错 | 接了数据库，必须教它认数据库的错 |
+| **ErrorClassifier** | 处理失败算什么错 | 接了数据库，必须教它认数据库的错 |
 | **BackpressureSignal** | 什么时候拒绝收货 | 需要根据消费端积压动态限流时 |
 | **BackfillSource** | 缓存丢了怎么回源 | 查重缓存需要从数据库冷启动时 |
 
-### 例 1：自定义落库（最常见）
+### 例 1：自定义出口（最常见）
 
 ```python
-from streamgate.protocols import RecordWriter, WriteResult
+from streamgate import ConsumeContext, Consumer, JsonObject
 
-class MyWriter:                      # 不用继承，duck typing
-    async def start(self): ...       # 建连接（框架启动时调一次）
-    async def write(self, batch):    # 幂等写一批（重复调安全）
-        ...                          # 你的写入逻辑
-        return WriteResult(counts={"my_table": len(batch)})
-    async def close(self): ...
+async def my_handler(batch: list[JsonObject], context: ConsumeContext) -> None:
+    ...  # 你的处理逻辑：幂等，正常返回 = 整批完成
 
-spec = ConsumeSpec(sink=MyWriter())  # 注入即可
+consumer = Consumer(..., handler=my_handler)   # 注入即可
 ```
 
 ### 例 2：教框架认数据库的错（接 DB 必做）
 
 ```python
-from streamgate import ErrorKind
+from streamgate import ConsumerOptions, ErrorKind
 
 class MyClassifier:
     def classify(self, exc, attempt) -> ErrorKind:
         if "timeout" in str(exc).lower():
             return ErrorKind.RETRY    # 瞬态错误 → 退避重试
-        return ErrorKind.POISON       # 内容问题 → 二分隔离进死信队列
+        return ErrorKind.POISON       # 内容问题 → 定位隔离进死信队列
 
-worker = ConsumerWorker(spec, ..., error_classifier=MyClassifier())
+consumer = Consumer(..., options=ConsumerOptions(classifier=MyClassifier()))
 ```
 
-不注入会怎样？默认分类器只认通用异常，不认识的都按 POISON 处理——不会丢数据（有探针保护），但会浪费一轮二分。**接数据库请务必注入对应分类器。**
+不注入会怎样？默认分类器只认通用异常，不认识的都按 POISON 处理——不会丢数据（有对照保护），但会浪费一轮定位。**接数据库请务必注入对应分类器**（生产级参考：`streamgate.contrib.sql_upsert.SQLAlchemyErrorClassifier`）。
 
 ### 例 3：注入准入策略（含回源）
 
@@ -178,7 +176,7 @@ class MyAdmission:
                                                             # 也可在此释放占位换"立即可重发"
     async def on_overwrite_accepted(self, record): ...      # 仅 overwrite：摘要写，返回 False
                                                             # → cache_updated=false
-    async def on_persisted(self, record): ...               # 消费落库成功后刷新
+    async def on_persisted(self, record): ...               # 消费处理成功后刷新
     # 另有 start / close / 健康探测方法，见 protocols.py
 
 binding = IngestBinding(..., admission=MyAdmission())       # 实例注入
@@ -206,7 +204,7 @@ admission = MyAdmission(backfill=MyBackfill())  # 回源传给你的策略，不
 | 配了，权威库说"确实没有" | 放行（确认是新数据） |
 | 配了，但权威库也挂了 | 仍拒绝——核实不了绝不猜 |
 
-两个内置准入策略都用不上回源：`NoAdmission` 压根不查重；`InMemoryAdmission` 的进程内字典本身就是权威（查不到 = 真的没有），代价是仅单进程有效、重启即清空——一旦多副本部署，就需要 Redis 查重 + 回源的两级结构（`streamgate.contrib.redis_admission` + `streamgate.contrib.sql_sink.SqlBackfill` 已内置这套组合）。
+两个内置准入策略都用不上回源：`NoAdmission` 压根不查重；`InMemoryAdmission` 的进程内字典本身就是权威（查不到 = 真的没有），代价是仅单进程有效、重启即清空——一旦多副本部署，就需要 Redis 查重 + 回源的两级结构（`streamgate.contrib.redis_admission` + `streamgate.contrib.sql_upsert.SqlBackfill` 已内置这套组合）。
 
 ### 例 4：自定义背压信号（跟着消费端积压走）
 
@@ -238,7 +236,7 @@ gateway = IngestGateway(..., signal=MySignal())    # 注入即可
 | Extra | 安装 | 子包 | 给你什么 |
 |---|---|---|---|
 | `[redis]` | `pip install "streamgate[redis]"` | `streamgate.contrib.redis_admission` | Redis 分布式查重（多实例安全，Lua 原子占位/冷回源/空实体哨兵/fail-closed） |
-| `[sql]` | `pip install "streamgate[sql]"` | `streamgate.contrib.sqlite_sink` / `.mssql_sink` / `.sql_sink` | SQL 幂等落库全套（SQLite ON CONFLICT / MSSQL MERGE+HOLDLOCK、引擎工厂、`SqlBackfill` 回源）+ 数据库异常分类器 |
+| `[sql]` | `pip install "streamgate[sql]"` | `streamgate.contrib.sqlite_upsert` / `.mssql_upsert` / `.sql_upsert` | SQL 幂等出口全套：`SqliteConsumer` / `MssqlConsumer` 预装配工厂（批量 upsert handler + 单条探针 + 数据库异常分类器三件套）、`upsert_outlet` 原语、引擎工厂、`SqlBackfill` 回源 |
 | `[http]` | `pip install "streamgate[http]"` | `streamgate.contrib.http_probe` | 积压探针 + 磁滞限流状态机（trip/recover 防抖、fail-closed） |
 
 ```python
@@ -261,11 +259,28 @@ binding = IngestBinding(
 )
 ```
 
+SQL 出口的开箱路径——工厂预接三件套，其余与核心 `Consumer` 完全一致：
+
+```python
+from models import Order                        # 你的 SQLModel 表
+from streamgate.contrib.sqlite_upsert import SqliteConsumer, Upsert
+
+consumer = SqliteConsumer(
+    db="sqlite+aiosqlite:///./data/app.db",
+    upserts=[Upsert(model=Order, keys=["order_id"])],
+    bootstrap_servers="localhost:29092",
+    topic="orders",
+    group_id="order-sink",
+    # batch_size / flush_timeout / options 与核心 Consumer 一致，可继续传
+)
+await consumer.run()
+```
+
 缺对应 extra 时 import 会报错并提示该装哪个 extras，不会出现裸的 `ModuleNotFoundError`。
 
 **稳定性**：contrib 为 provisional（Beta 级）——可直接上生产（这些实现并入前已生产验证），但小版本内允许调整签名；核心 API 契约不受影响（核心层永不 import contrib）。
 
-仓库根的 [`examples/docker-compose.yml`](examples/docker-compose.yml) 提供 Kafka + Redis 双服务；五个可运行演示见 [`examples/`](examples/)（策略演示直接 import contrib；[`examples/prod_pipeline/`](examples/prod_pipeline/) 把 Redis 准入 + HTTP 探活 + MSSQL 落库的生产拓扑一次接全）。
+仓库根的 [`examples/docker-compose.yml`](examples/docker-compose.yml) 提供 Kafka + Redis 双服务；五个可运行演示见 [`examples/`](examples/)（策略演示直接 import contrib；[`examples/prod_pipeline/`](examples/prod_pipeline/) 把 Redis 准入 + HTTP 探活 + MSSQL 出口的生产拓扑一次接全）。
 
 ---
 
@@ -274,15 +289,15 @@ binding = IngestBinding(
 ```bash
 pip install streamgate             # 只装 aiokafka + loguru + pydantic
 pip install "streamgate[redis]"    # + Redis 分布式查重
-pip install "streamgate[sql]"      # + SQL 幂等落库（SQLite + MSSQL）
+pip install "streamgate[sql]"      # + SQL 幂等出口（SQLite + MSSQL）
 pip install "streamgate[http]"     # + HTTP 探活背压
 ```
 
-其他数据库（PostgreSQL、MySQL……）：自己实现 `RecordWriter`——contrib 内置路径用的也是同一个钩子。
+其他去处（PostgreSQL、MySQL、ES……）：自己写 `handler`——contrib 内置路径接的也是同一个契约。
 
 ## 配置
 
-组件均用类型化配置对象，与 `KAFKA__*` / `CONSUMER__*` / `BACKPRESSURE__*` 环境变量一一对应；必填项（如 topic、group_id）缺失即启动失败并附修复指引，绝不带猜测默认值上路。数据库/Redis 连接配置归你的应用管（示例各自带本地配置类）。详见 [CONFIGURATION.md](CONFIGURATION.md)。
+`Consumer` 必填项可直接传参，未传时回退同名环境变量（`KAFKA__BOOTSTRAP_SERVERS` / `KAFKA__TOPIC` / `CONSUMER__GROUP_ID`）；高级项收口在 `ConsumerOptions`（DLQ、调优、指标窗口等），同样跟随 `CONSUMER__*` 环境变量回退。接收侧组件用类型化配置对象，与 `KAFKA__*` / `BACKPRESSURE__*` 一一对应；必填项缺失即启动失败并附修复指引，绝不带猜测默认值上路。数据库/Redis 连接配置归你的应用管（示例各自带本地配置类）。详见 [CONFIGURATION.md](CONFIGURATION.md)。
 
 ## 架构
 
@@ -296,13 +311,20 @@ pip install "streamgate[http]"     # + HTTP 探活背压
         ▼
       Kafka ◄──────────────────────────────────────────────┐
         │                                                  │ DLQ ◄─ 坏数据
-        ▼                                                  │      （二分 + 探针对照）
-  ConsumerWorker ──► RecordWriter（你的存储） ──────────────┘
-        │             └─ ErrorClassifier（注入）
+        ▼                                                  │      （单条探针定位）
+     Consumer ──► handler（你的出口：SQL / 分析 / 转发 /     │
+        │             告警……）─────────────────────────────┘
+        │             └─ ErrorClassifier（经 options 注入）
         └─ 健康快照（状态 + 速率/延迟指标，用你自己的 Web 框架暴露）
 ```
 
+`Consumer` 是一个可嵌入任何宿主的消费循环——脚本、FastAPI 服务、独立 worker 皆可；进程边界归使用方，循环本身、位点、重试、自愈、优雅停机归框架。
+
 核心层禁止 import `streamgate.contrib`（contrib 反向依赖核心是合法的）——由 import-linter 分层契约在 CI 强制拦截；contrib 的第三方依赖全部走 extras 可选声明，裸装 `pip install streamgate` 不携带。
+
+## 从 0.x 迁移
+
+1.0.0 对消费侧做了破坏性重设计：`ConsumerWorker` + `ConsumeSpec` + `RecordWriter` 由扁平 `Consumer` 构造器替代。完整的新旧对照（API、指标名、日志事件、环境变量、import 路径）见 [CHANGELOG](CHANGELOG.md)。
 
 ## 路线图
 

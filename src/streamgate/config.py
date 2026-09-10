@@ -1,39 +1,19 @@
-"""streamgate 组件配置对象（每组件独立，Spec 内可覆写）。
+"""streamgate 组件配置对象（每组件独立）。
 
-配置键名与既有环境变量逐字对应（KAFKA__* / CONSUMER__* / BACKPRESSURE__*），
-调用方零配置迁移。DB/Redis 是使用方的世界：连接配置由使用方/示例自带
-（不进框架核心）。
+配置键名与既有环境变量逐字对应（KAFKA__* / CONSUMER__* / BACKPRESSURE__*）。
+1.0.0 起消费侧配置不再经配置对象装配：Consumer 直接以一等参数构造
+（bootstrap_servers/topic/group_id 未传时回退同名环境变量；调优项收口在
+ConsumerOptions.tuning / options.dlq，同样跟随 CONSUMER__* 环境变量回退）。
+DB/Redis 是使用方的世界：连接配置由使用方/示例自带（不进框架核心）。
 """
 
 from pydantic import BaseModel, field_validator
-
-
-class ConsumerConfig(BaseModel):
-    # 必填：消费服务装配时校验（缺失即启动失败，不做项目专属默认）
-    group_id: str | None = None
-    batch_size: int = 100
-    batch_timeout_seconds: float = 5.0
-    max_retries: int = 3
-    retry_backoff_base: float = 1.0
-    # 重连/暂停恢复指数退避（对齐 ingest producer 的自愈策略，替代原硬编码 1.0/30.0）
-    reconnect_base_backoff_seconds: float = 1.0
-    reconnect_max_backoff_seconds: float = 30.0
-    max_poll_records: int = 500
-    session_timeout_ms: int = 30000
-    max_poll_interval_ms: int = 300000
-    auto_offset_reset: str = "earliest"
-    backlog_check_interval_seconds: float = 30.0  # 积压时长检查周期
-    # --- DLQ 隔离：消费端坏数据兜底 ---
-    dlq_enabled: bool = True    # 总开关；false=回退 paused 旧行为（紧急逃生门）
-    dlq_send_retries: int = 3   # DLQ 单条发送总尝试次数（含首次；耗尽即批次转 paused）
 
 
 class KafkaConfig(BaseModel):
     bootstrap_servers: str = "kafka:9092"
     # 必填：producer/consumer 装配时校验（缺失即启动失败，不做项目专属默认）
     topic: str | None = None
-    # 死信 topic（消费端隔离坏数据留档）；启用 DLQ 时必填
-    dlq_topic: str | None = None
     acks: str = "all"
     request_timeout_ms: int = 10000
     enable_idempotence: bool = True

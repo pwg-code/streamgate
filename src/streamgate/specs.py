@@ -1,24 +1,21 @@
-"""Tier 0 声明式 API：IngestBinding / ConsumeSpec。
+"""Tier 0 声明式 API：IngestBinding（接收侧）。
 
 机制归框架，策略归使用方：
-- IngestBinding 声明"接收什么消息、怎么判定唯一性"（HTTP 呈现归使用方适配层；
-  唯一性载体是注入的 AdmissionPolicy 或零 I/O 内置捷径）；
-- ConsumeSpec 声明"消费后做什么"：sink（RecordWriter 注入，唯一落库路径）/
-  on_record（无 sink 逃生口）二选一。
+IngestBinding 声明"接收什么消息、怎么判定唯一性"（HTTP 呈现归使用方适配层；
+唯一性载体是注入的 AdmissionPolicy 或零 I/O 内置捷径）。
+
+消费侧声明式 API（ConsumeSpec）已在 1.0.0 移除：数据出口即
+Consumer(bootstrap_servers, topic, group_id, handler)——
+见 CHANGELOG.md 1.0.0 迁移指南。
 """
 
-from collections.abc import Callable, Hashable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel
 
-from streamgate.protocols import (
-    AdmissionPolicy,
-    JsonObject,
-    RecordHandler,
-    RecordWriter,
-)
+from streamgate.protocols import AdmissionPolicy, JsonObject
 
 # ingest 侧记录类型：schema 锚定推断（lambda 策略钩子获得精确字段补全）。
 IngestRecordT = TypeVar("IngestRecordT", bound=BaseModel)
@@ -53,39 +50,4 @@ class IngestBinding(Generic[IngestRecordT]):
     kafka_unavailable_detail: str = "Message broker unavailable"
 
 
-@dataclass
-class ConsumeSpec:
-    """消费侧声明：批量缓冲 → 落地 → on_persisted / DLQ。
-
-    落地目标二选一（声明期校验，互斥）：
-    - sink：RecordWriter 注入点（唯一落库路径：写库/写 ES/转发/告警…）
-    - on_record：无 sink 逃生口（处理成功即整批可提交，失败走既有重试自愈）
-    """
-
-    topic: str | None = None                      # None → KAFKA__TOPIC
-    group_id: str | None = None                   # None → CONSUMER__GROUP_ID
-    sink: RecordWriter | None = None              # 唯一写侧注入点（与 on_record 互斥）
-    on_record: RecordHandler | None = None        # Tier 2：无 sink 时的处理逃生口
-    persist_policy: AdmissionPolicy[JsonObject] | None = None  # 仅消费侧 on_persisted（权威刷新）
-    collapse_key: Callable[[JsonObject], Hashable] | None = None
-    log_context: Callable[[JsonObject], JsonObject] | None = None
-    expected_message_type: str | None = None       # None=不校验（兼容历史无 type 消息）
-    dlq: bool | None = None                        # None → 跟随 CONSUMER__DLQ_ENABLED
-    dlq_message_type: str = "streamgate_dlq"
-    dlq_topic: str | None = None                   # None → KAFKA__DLQ_TOPIC
-
-    def __post_init__(self) -> None:
-        if self.sink is not None and self.on_record is not None:
-            raise ValueError(
-                "ConsumeSpec: sink and on_record are mutually exclusive; keep only one"
-            )
-        if self.sink is None and self.on_record is None:
-            raise ValueError(
-                "ConsumeSpec requires a landing target: set sink (a RecordWriter "
-                "injection for your storage) or on_record (handle records yourself). "
-                "See examples/pure_pipeline (on_record) and "
-                "examples/sqlite_sink (sink) in the repository."
-            )
-
-
-__all__ = ["ConsumeSpec", "IngestBinding", "IngestRecordT"]
+__all__ = ["IngestBinding", "IngestRecordT"]

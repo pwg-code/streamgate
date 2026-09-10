@@ -1,16 +1,15 @@
 """消费循环：批量缓冲（size/timeout 双触发）、毒丸跳过并提交、
 paused 指数退避自愈、ErrorClassifier 分类 → RETRY/POISON/FATAL 三路处置、
-DLQ 二分隔离、停机 flush。"""
+DLQ 探针定位隔离、停机 flush。"""
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from datetime import datetime, timezone
 
 from aiokafka.errors import CommitFailedError
 from aiokafka.structs import OffsetAndMetadata, TopicPartition
 
-from streamgate.config import ConsumerConfig
 from streamgate.consumer.classifier import DefaultErrorClassifier
 from streamgate.consumer.dlq import (
     BisectOutcome,
@@ -18,71 +17,85 @@ from streamgate.consumer.dlq import (
     DlqProducer,
     DlqSendError,
     QuarantineRequest,
+    _build_quarantine_request,
     _original_message,
-    locate_and_write,
+    locate_and_quarantine,
 )
+from streamgate.consumer.options import ResolvedRuntimeTuning
 from streamgate.obs.logging import logger
 from streamgate.obs.metrics import DEFAULT_METRICS, ConsumeMetrics, MetricsSink
 from streamgate.protocols import (
     AdmissionPolicy,
+    BatchHandler,
     ConsumeContext,
     Envelope,
     ErrorClassifier,
     ErrorKind,
     JsonObject,
     MessageCodec,
-    RecordWriter,
+    Probe,
 )
-from streamgate.specs import ConsumeSpec
 from streamgate.transport.kafka import KafkaConsumerService, KafkaRecord
 
 
-def _backlog_level(age_seconds: float, existence_ttl_seconds: int) -> str:
+def _backlog_level(age_seconds: float, backlog_ttl_seconds: int) -> str:
     """积压时长告警阈值：WARN > TTL/2（窗口打开前最后干预机会）；ERROR > TTL*0.8。"""
-    if age_seconds > existence_ttl_seconds * 0.8:
+    if age_seconds > backlog_ttl_seconds * 0.8:
         return "error"
-    if age_seconds > existence_ttl_seconds / 2:
+    if age_seconds > backlog_ttl_seconds / 2:
         return "warning"
     return "ok"
 
 
 class ConsumeRuntime:
-    """消费服务运行时状态（非线程安全，单 event loop 内安全）。"""
+    """消费循环运行时状态（非线程安全，单 event loop 内安全）。"""
 
     def __init__(
         self,
         *,
-        spec: ConsumeSpec,
-        consumer_config: ConsumerConfig,
-        writer: RecordWriter | None,
+        group_id: str,
+        handler: BatchHandler,
+        probe: Probe | None,
+        batch_size: int,
+        flush_timeout_seconds: float,
+        tuning: ResolvedRuntimeTuning,
+        expected_type: str | None,
+        collapse_key: Callable[[JsonObject], Hashable] | None,
+        log_context: Callable[[JsonObject], JsonObject] | None,
+        backlog_ttl_seconds: int,
         consumer: KafkaConsumerService | None,
         codec: MessageCodec,
-        existence_ttl_seconds: int,
-        persist_policy: AdmissionPolicy[JsonObject] | None = None,
-        cache: object | None = None,
+        persist_hook: AdmissionPolicy[JsonObject] | None = None,
+        health_probe: object | None = None,
         dlq: DlqProducer | None = None,
         metrics_sink: MetricsSink | None = None,
         metrics: ConsumeMetrics | None = None,
         error_classifier: ErrorClassifier | None = None,
     ) -> None:
-        self.spec = spec
-        self.consumer_config = consumer_config
-        self.writer = writer
+        self.group_id = group_id
+        self.handler = handler
+        self.probe = probe
+        self.batch_size = batch_size
+        self.flush_timeout_seconds = flush_timeout_seconds
+        self.tuning = tuning
+        self.expected_type = expected_type
+        self.collapse_key = collapse_key
+        self.log_context = log_context
+        self.backlog_ttl_seconds = backlog_ttl_seconds
         self.consumer = consumer
         self.codec = codec
-        self.existence_ttl_seconds = existence_ttl_seconds
-        self.persist_policy = persist_policy
-        self.cache = cache
+        self.persist_hook = persist_hook
+        self.health_probe = health_probe
         self.dlq = dlq
         self.metrics_sink = metrics_sink or DEFAULT_METRICS
         # 速率指标窗（默认构造 60s 窗口；构造时刻即进程启动锚点）
         self.metrics = metrics if metrics is not None else ConsumeMetrics()
         self.error_classifier = error_classifier or DefaultErrorClassifier()
         self.buffer: list[BufferedMessage] = []
-        self.last_write_at: datetime | None = None
+        self.last_handle_at: datetime | None = None
         self.last_commit_at: datetime | None = None
         # --- 积压时长监控 ---
-        self.backlog_oldest_ts: float | None = None      # 最老未落库消息（epoch 秒）
+        self.backlog_oldest_ts: float | None = None      # 最老未处理消息（epoch 秒）
         self.last_backlog_check_at: datetime | None = None
         self.running: bool = True
         self.paused: bool = False
@@ -96,7 +109,7 @@ class ConsumeRuntime:
         return len(self.buffer)
 
     def context_snapshot(self) -> ConsumeContext:
-        """Tier 2 只读快照（位点/commit 不开放）。"""
+        """handler 只读快照（位点/commit 不开放）。"""
         backlog_age = (
             time.time() - self.backlog_oldest_ts
             if self.backlog_oldest_ts is not None
@@ -114,7 +127,7 @@ class ConsumeRuntime:
 def _note_backlog_ts(runtime: ConsumeRuntime, timestamp_ms: int | None) -> None:
     """记录进入缓冲区的消息时间戳，保留最老值。
 
-    近似语义：缓冲区最老消息时间戳 = 最老未落库消息
+    近似语义：缓冲区最老消息时间戳 = 最老未处理消息
     （paused 期间不再 poll，缓冲区即积压下界；Kafka 侧未拉取消息只会更晚到达）。
     """
     if timestamp_ms is None:
@@ -128,11 +141,11 @@ def _check_backlog_age(runtime: ConsumeRuntime) -> None:
     """周期性积压检查：指标输出 + 阈值告警。"""
     if runtime.backlog_oldest_ts is not None:
         age = time.time() - runtime.backlog_oldest_ts
-        ttl = runtime.existence_ttl_seconds
+        ttl = runtime.backlog_ttl_seconds
         fields = {
             "backlog_age_seconds": round(age, 1),
             "pending_count": runtime.pending_count,
-            "existence_ttl_seconds": ttl,
+            "backlog_ttl_seconds": ttl,
         }
         logger.info("backlog_age_seconds", **fields)
         level = _backlog_level(age, ttl)
@@ -144,23 +157,23 @@ def _check_backlog_age(runtime: ConsumeRuntime) -> None:
 
 def _dedup_by_collapse_key(
     batch: list[BufferedMessage],
-    collapse_key: Callable[[JsonObject], object],
+    collapse_key: Callable[[JsonObject], Hashable],
 ) -> list[BufferedMessage]:
-    """按 collapse_key 去重保留最后一条（与写库侧防御性去重同序）。"""
-    seen: dict[object, BufferedMessage] = {}
+    """按 collapse_key 去重保留最后一条（与处理侧防御性去重同序）。"""
+    seen: dict[Hashable, BufferedMessage] = {}
     for m in batch:
         seen[collapse_key(m.data)] = m  # 后者覆盖前者
     return list(seen.values())
 
 
-async def _notify_persisted(runtime: ConsumeRuntime, batch: list[BufferedMessage]) -> None:
-    """落库成功 → 权威刷新/on_persisted 钩子（best-effort，策略内部兜底异常）。"""
-    policy = runtime.persist_policy
+async def _notify_handled(runtime: ConsumeRuntime, batch: list[BufferedMessage]) -> None:
+    """整批处理成功 → 权威刷新/on_persisted 钩子（best-effort，策略内部兜底异常）。"""
+    policy = runtime.persist_hook
     if policy is None:
         return
     records = (
-        _dedup_by_collapse_key(batch, runtime.spec.collapse_key)
-        if runtime.spec.collapse_key is not None
+        _dedup_by_collapse_key(batch, runtime.collapse_key)
+        if runtime.collapse_key is not None
         else batch
     )
     for m in records:
@@ -171,30 +184,31 @@ async def _notify_persisted(runtime: ConsumeRuntime, batch: list[BufferedMessage
 
 
 async def _commit_quietly(runtime: ConsumeRuntime, batch_size: int) -> None:
-    """写库后提交位点：CommitFailed 只记日志不重试写库。"""
+    """处理后提交位点：CommitFailed 只记日志不重试处理。"""
     consumer = runtime.consumer
     assert consumer is not None  # 装配点保证（prepare 必建 consumer）
     try:
         await consumer.commit()
     except CommitFailedError as e:
         logger.warning(
-            "offset_commit_failed_after_write",
+            "offset_commit_failed_after_handle",
             error=str(e),
             batch_size=batch_size,
         )
 
 
-async def _try_write_batch(runtime: ConsumeRuntime) -> bool:
-    """尝试写入当前缓冲区。返回 True 表示成功，False 表示失败。
+def _note_handle_success(
+    runtime: ConsumeRuntime, batch_size: int, duration_ms: float
+) -> None:
+    """处理成功埋点：处理条数 + 单批耗时（仅成功批次记延迟，防超时污染 avg/max）。"""
+    runtime.metrics.handled.record(batch_size)
+    runtime.metrics.handle_latency.record_latency(duration_ms)
 
-    双路径分发：有 sink 走幂等 upsert 编排（含 DLQ 二分）；
-    无 sink（on_record 模式）处理成功即整批可提交。
-    """
-    if not runtime.buffer:
-        return True
-    if runtime.writer is None:
-        return await _try_handler_batch(runtime)
-    return await _try_upsert_batch(runtime)
+
+def _note_handle_failure(runtime: ConsumeRuntime, batch_size: int) -> None:
+    """处理失败埋点：失败条数 + 重试次数（每次捕获异常各计一次）。"""
+    runtime.metrics.handle_failed.record(batch_size)
+    runtime.metrics.retries.record(1)
 
 
 def _abort_fatal(runtime: ConsumeRuntime, exc: Exception) -> None:
@@ -203,47 +217,50 @@ def _abort_fatal(runtime: ConsumeRuntime, exc: Exception) -> None:
     runtime.running = False
 
 
-async def _try_handler_batch(runtime: ConsumeRuntime) -> bool:
-    """on_record 模式：钩子正常返回=整批可提交；抛异常=按分类处置。
+async def _try_handle_batch(runtime: ConsumeRuntime) -> bool:
+    """尝试处理当前缓冲区。返回 True 表示成功，False 表示失败。
 
-    RETRY 退避重试；POISON/FATAL 停止重试。DLQ 二分不适用（无写侧可
-    探针定位），POISON 同样转既有 paused 自愈（仅省去无意义重试）。
+    唯一处理路径：handler(batch, context) 正常返回 = 整批处理成功
+    （提交位点）；抛异常 = 按 ErrorClassifier 分类处置——
+    RETRY 退避重试 → POISON 立即转定位隔离 → FATAL 停机。
     """
-    handler = runtime.spec.on_record
-    assert handler is not None  # spec 校验保证（writer 为空必为 on_record 模式）
-    config = runtime.consumer_config
+    if not runtime.buffer:
+        return True
     batch: list[BufferedMessage] = list(runtime.buffer)
     batch_size = len(batch)
     records = [m.data for m in batch]
     context = runtime.context_snapshot()
-    logger.info("batch_write_start", batch_size=batch_size)
+    logger.info("batch_handle_start", batch_size=batch_size)
 
-    for attempt in range(config.max_retries):
+    poison_error: Exception | None = None
+    for attempt in range(runtime.tuning.max_retries):
         try:
             t0 = time.monotonic()
-            await handler(records, context)
+            await runtime.handler(records, context)
             duration_ms = round((time.monotonic() - t0) * 1000, 1)
+            _note_handle_success(runtime, batch_size, duration_ms)
+            runtime.last_handle_at = datetime.now(timezone.utc)
             runtime.buffer.clear()                      # 先清 buffer（已处理成功）
             runtime.backlog_oldest_ts = None            # 积压已清（下一批重新计）
-            runtime.last_write_at = datetime.now(timezone.utc)
-            await _notify_persisted(runtime, batch)
-            await _commit_quietly(runtime, batch_size)
+            await _notify_handled(runtime, batch)
+            await _commit_quietly(runtime, batch_size)  # 再 commit，失败只记日志
             runtime.last_commit_at = datetime.now(timezone.utc)
             logger.info(
-                "batch_write_success",
+                "batch_handle_success",
                 batch_size=batch_size,
                 duration_ms=duration_ms,
             )
             return True
         except Exception as e:
+            _note_handle_failure(runtime, batch_size)
             kind = runtime.error_classifier.classify(e, attempt)
-            backoff = config.retry_backoff_base * (2 ** attempt)
+            backoff = runtime.tuning.retry_backoff_base * (2**attempt)
             logger.error(
-                "batch_write_failed",
+                "batch_handle_failed",
                 error=str(e),
                 batch_size=batch_size,
                 retry_count=attempt + 1,
-                max_retries=config.max_retries,
+                max_retries=runtime.tuning.max_retries,
                 backoff_seconds=backoff,
                 error_kind=kind.value,
             )
@@ -251,215 +268,176 @@ async def _try_handler_batch(runtime: ConsumeRuntime) -> bool:
                 _abort_fatal(runtime, e)
                 return False
             if kind is ErrorKind.POISON:
-                break  # 无写侧不可二分：直接转 paused（重试毒批无意义）
-            if attempt < config.max_retries - 1:
-                await asyncio.sleep(backoff)
-
-    logger.error(
-        "batch_write_exhausted_retries",
-        batch_size=batch_size,
-        max_retries=config.max_retries,
-    )
-    return False
-
-
-def _note_sink_write_success(
-    runtime: ConsumeRuntime, batch_size: int, duration_ms: float
-) -> None:
-    """入库成功埋点：入库条数 + 单批写入耗时（仅成功批次记延迟，防超时污染 avg/max）。"""
-    runtime.metrics.sink_written.record(batch_size)
-    runtime.metrics.sink_write_latency.record_latency(duration_ms)
-
-
-def _note_sink_write_failure(runtime: ConsumeRuntime, batch_size: int) -> None:
-    """入库失败埋点：失败条数 + 重试次数（每次捕获异常各计一次）。"""
-    runtime.metrics.sink_write_failed.record(batch_size)
-    runtime.metrics.retries.record(1)
-
-
-async def _try_upsert_batch(runtime: ConsumeRuntime) -> bool:
-    """sink 模式：按 ErrorClassifier 分类处置——
-    RETRY 退避重试 → POISON 立即转 DLQ 二分隔离 → FATAL 停机。"""
-    writer = runtime.writer
-    assert writer is not None  # 分发点保证
-    config = runtime.consumer_config
-    batch: list[BufferedMessage] = list(runtime.buffer)
-    batch_size = len(batch)
-    logger.info("batch_write_start", batch_size=batch_size)
-
-    poison_error: Exception | None = None
-    for attempt in range(config.max_retries):
-        try:
-            t0 = time.monotonic()
-            result = await writer.write([m.data for m in batch])
-            duration_ms = round((time.monotonic() - t0) * 1000, 1)  # 写耗时指标
-            _note_sink_write_success(runtime, batch_size, duration_ms)
-            runtime.last_write_at = datetime.now(timezone.utc)
-            runtime.buffer.clear()                      # 先清 buffer（数据已落库）
-            runtime.backlog_oldest_ts = None            # 积压已清（下一批重新计）
-            # 权威刷新 / on_persisted（失败仅 WARN）
-            await _notify_persisted(runtime, batch)
-            await _commit_quietly(runtime, batch_size)  # 再 commit，失败只记日志
-            runtime.last_commit_at = datetime.now(timezone.utc)
-            logger.info(
-                "batch_write_success",
-                batch_size=batch_size,
-                **{f"{name}_count": count for name, count in result.counts.items()},
-                duration_ms=duration_ms,                # 写耗时
-            )
-            return True
-        except Exception as e:
-            _note_sink_write_failure(runtime, batch_size)
-            kind = runtime.error_classifier.classify(e, attempt)
-            backoff = config.retry_backoff_base * (2**attempt)
-            logger.error(
-                "batch_write_failed",
-                error=str(e),
-                batch_size=batch_size,
-                retry_count=attempt + 1,
-                max_retries=config.max_retries,
-                backoff_seconds=backoff,
-                error_kind=kind.value,
-            )
-            if kind is ErrorKind.FATAL:
-                _abort_fatal(runtime, e)
-                return False
-            if kind is ErrorKind.POISON:
-                poison_error = e  # 毒批：重试无意义，立即转二分隔离
+                poison_error = e  # 毒批：重试无意义，立即转定位隔离
                 break
-            if attempt < config.max_retries - 1:
+            if attempt < runtime.tuning.max_retries - 1:
                 await asyncio.sleep(backoff)
 
     if poison_error is not None:
-        return await _handle_write_failure(runtime, writer, batch, poison_error)
+        return await _handle_poison_batch(runtime, batch, poison_error)
     logger.error(
-        "batch_write_exhausted_retries",
+        "batch_handle_exhausted_retries",
         batch_size=batch_size,
-        max_retries=config.max_retries,
+        max_retries=runtime.tuning.max_retries,
     )
     return False  # RETRY 耗尽：paused 自愈
 
 
-async def _handle_write_failure(
+def _log_quarantined(
+    runtime: ConsumeRuntime, record: BufferedMessage, request: QuarantineRequest
+) -> None:
+    """单条隔离日志（含使用方注入的 log_context 扩展字段）。"""
+    log_ctx = (
+        runtime.log_context(record.data) if runtime.log_context is not None else {}
+    )
+    logger.error(
+        "consumer_record_quarantined",
+        **log_ctx,
+        partition=request.partition,
+        offset=request.offset,
+        reason=request.category,
+        error=request.error,
+    )
+
+
+async def _quarantine_whole_batch(
     runtime: ConsumeRuntime,
-    writer: RecordWriter,
     batch: list[BufferedMessage],
     poison_error: Exception,
 ) -> bool:
-    """POISON 处置：DLQ 二分定位隔离（探针对照，防误隔离）。
+    """无探针的 POISON 处置：整批隔离后提交位点（不重试毒批）。
 
-    writer 由 _try_upsert_batch 收窄后显式传入（此路径必有写侧）。
-    分类器已判定 POISON（重试无意义），此处只决定"能否隔离"：
+    隔离中途失败（DlqSendError）→ 不提交位点，整批转 paused 自愈
+    （下轮重试整批隔离；已隔离条目会重复进 DLQ，留档幂等可接受）。
     """
-    config = runtime.consumer_config
-    logger.error(
-        "batch_write_exhausted_retries",
-        batch_size=len(batch),
-        max_retries=config.max_retries,
-    )
     dlq = runtime.dlq
-    if dlq is None or not config.dlq_enabled:
-        return False  # 逃生门 CONSUMER__DLQ_ENABLED=false / 未接线：paused 旧行为
+    assert dlq is not None  # 调用点保证（DLQ 关闭走 paused 分支，不进本函数）
+    error = str(poison_error)
+    quarantined: list[tuple[BufferedMessage, QuarantineRequest]] = []
+    try:
+        for m in batch:
+            request = _build_quarantine_request(m, ErrorKind.POISON, error)
+            await dlq.quarantine(request)
+            quarantined.append((m, request))
+    except DlqSendError:
+        # dlq_send_failed 已由 DlqProducer 记日志
+        return False
+    runtime.buffer.clear()
+    runtime.backlog_oldest_ts = None
+    runtime.last_handle_at = datetime.now(timezone.utc)
+    runtime.quarantined_count += len(quarantined)
+    runtime.metrics.handle_failed.record(len(quarantined))
+    for m, request in quarantined:
+        _log_quarantined(runtime, m, request)
+    await _commit_quietly(runtime, len(batch))
+    runtime.last_commit_at = datetime.now(timezone.utc)
     logger.info(
-        "write_failure_classified",
+        "batch_quarantined_without_probe",
+        batch_size=len(batch),
+        quarantined=len(quarantined),
+    )
+    return True
+
+
+async def _handle_poison_batch(
+    runtime: ConsumeRuntime,
+    batch: list[BufferedMessage],
+    poison_error: Exception,
+) -> bool:
+    """POISON 处置矩阵（分类器已判定 POISON，重试无意义）：
+
+    - 已提供 probe：逐条探针定位——好条已处理、坏条精确隔离，位点推进；
+    - 未提供 probe：整批隔离后提交位点；
+    - DLQ 关闭（逃生门）：转 paused 自愈旧行为。
+    """
+    dlq = runtime.dlq
+    if dlq is None:
+        return False  # 逃生门 DlqOptions.enabled=false / 未接线：paused 旧行为
+    logger.info(
+        "handle_failure_classified",
         category=ErrorKind.POISON.value,
         error=str(poison_error),
     )
+    if runtime.probe is None:
+        return await _quarantine_whole_batch(runtime, batch, poison_error)
     logger.warning(
         "batch_bisect_triggered",
         batch_size=len(batch),
         error=str(poison_error),
     )
     try:
-        outcome = await locate_and_write(
-            writer, dlq, batch, ErrorKind.POISON, str(poison_error)
+        outcome = await locate_and_quarantine(
+            runtime.probe, dlq, batch, ErrorKind.POISON, str(poison_error)
         )
     except DlqSendError:
         # dlq_send_failed 已由 DlqProducer 记日志；批次不提交 offset、转 paused
-        # 下轮整体重试（好条幂等重写，坏条重复隔离仅 DLQ 多一条，可接受）
+        # 下轮整体重试（好条幂等重处理，坏条重复隔离仅 DLQ 多一条，可接受）
         return False
     if outcome is None:
-        return False  # 探针失败 → 疑似存储故障 → paused（不隔离任何数据）
-    return await _finalize_bisect_outcome(runtime, batch, outcome)
+        return False  # 对照探针失败 → 疑似出口组件故障 → paused（不隔离任何数据）
+    return await _finalize_locate_outcome(runtime, batch, outcome)
 
 
-async def _finalize_bisect_outcome(
+async def _finalize_locate_outcome(
     runtime: ConsumeRuntime,
     batch: list[BufferedMessage],
     outcome: BisectOutcome,
 ) -> bool:
-    """定位完成：好条已入库、坏条已隔离，按成功等价收尾。"""
+    """定位完成：好条已处理、坏条已隔离，按成功等价收尾。"""
     runtime.buffer.clear()
     runtime.backlog_oldest_ts = None
-    runtime.last_write_at = datetime.now(timezone.utc)
+    runtime.last_handle_at = datetime.now(timezone.utc)
     runtime.quarantined_count += len(outcome.quarantined)
-    # 好条计入库成功；被隔离条视为入库失败（不计延迟：未真正写入库）
-    runtime.metrics.sink_written.record(len(outcome.written))
-    runtime.metrics.sink_write_failed.record(len(outcome.quarantined))
+    # 好条计处理成功；被隔离条视为处理失败（不计延迟：未真正完成处理）
+    runtime.metrics.handled.record(len(outcome.handled))
+    runtime.metrics.handle_failed.record(len(outcome.quarantined))
     for q in outcome.quarantined:
-        log_ctx = (
-            runtime.spec.log_context(q.message.data)
-            if runtime.spec.log_context is not None
-            else {}
-        )
-        logger.error(
-            "consumer_record_quarantined",
-            **log_ctx,
-            partition=q.request.partition,
-            offset=q.request.offset,
-            reason=q.request.category,
-            error=q.request.error,
-        )
-    if outcome.written:
-        # 只刷新实际入库的好条；被隔离条不动占位（
+        _log_quarantined(runtime, q.message, q.request)
+    if outcome.handled:
+        # 只刷新实际处理完成的好条；被隔离条不动占位（
         # 占位残留 + 后续 409 是正确终态，阻止坏数据静默循环重灌）
-        await _notify_persisted(runtime, outcome.written)
+        await _notify_handled(runtime, outcome.handled)
     await _commit_quietly(runtime, len(batch))
     runtime.last_commit_at = datetime.now(timezone.utc)
     logger.info(
-        "batch_write_success_with_quarantine",
+        "batch_handle_success_with_quarantine",
         batch_size=len(batch),
-        written=len(outcome.written),
+        handled=len(outcome.handled),
         quarantined=len(outcome.quarantined),
     )
     return True
 
 
-def _write_timeout_due(runtime: ConsumeRuntime) -> bool:
-    """缓冲区非空且距上次写入超过 batch_timeout_seconds。"""
-    config = runtime.consumer_config
-    if not (runtime.buffer and runtime.last_write_at):
+def _flush_timeout_due(runtime: ConsumeRuntime) -> bool:
+    """缓冲区非空且距上次处理超过 flush_timeout_seconds。"""
+    if not (runtime.buffer and runtime.last_handle_at):
         return False
     elapsed = (
-        datetime.now(timezone.utc) - runtime.last_write_at
+        datetime.now(timezone.utc) - runtime.last_handle_at
     ).total_seconds()
-    return elapsed >= config.batch_timeout_seconds
+    return elapsed >= runtime.flush_timeout_seconds
 
 
-async def _trigger_write(runtime: ConsumeRuntime) -> bool:
-    """触发一次写入；失败转 paused（超时/条数触发路径共用；FATAL 已停机则不再标 paused）。"""
-    success = await _try_write_batch(runtime)
+async def _trigger_flush(runtime: ConsumeRuntime) -> bool:
+    """触发一次批处理；失败转 paused（超时/条数触发路径共用；FATAL 已停机则不再标 paused）。"""
+    success = await _try_handle_batch(runtime)
     if not success and runtime.running:
         runtime.paused = True
-        logger.error("consumer_paused_due_to_write_failures")
+        logger.error("consumer_paused_due_to_handle_failures")
     return success
 
 
 async def _paused_recovery_tick(runtime: ConsumeRuntime) -> None:
-    """暂停状态下的恢复写入（指数退避，上限 reconnect_max_backoff_seconds）。"""
-    config = runtime.consumer_config
-    backoff = min(
-        config.reconnect_max_backoff_seconds,
-        config.reconnect_base_backoff_seconds
-        * (2 ** min(runtime.recover_attempt, 5)),
-    )
+    """暂停状态下的恢复处理（指数退避，上限 reconnect_max）。"""
+    tuning = runtime.tuning
+    backoff = tuning.backoff_seconds(runtime.recover_attempt)
     logger.info(
         "consumer_paused_retry",
         attempt=runtime.recover_attempt + 1,
         backoff_seconds=backoff,
     )
     await asyncio.sleep(backoff)
-    if await _try_write_batch(runtime):
+    if await _try_handle_batch(runtime):
         runtime.paused = False
         runtime.recover_attempt = 0
         logger.info("consumer_resumed_after_recovery")
@@ -476,18 +454,14 @@ async def _ensure_consumer_ready(runtime: ConsumeRuntime) -> bool:
         return False
     if consumer.started:
         return True
-    config = runtime.consumer_config
+    tuning = runtime.tuning
     try:
         await consumer.start()
         runtime.reconnect_attempt = 0
         return True
     except Exception as e:
         runtime.reconnect_attempt += 1
-        backoff = min(
-            config.reconnect_max_backoff_seconds,
-            config.reconnect_base_backoff_seconds
-            * (2 ** min(runtime.reconnect_attempt - 1, 5)),
-        )
+        backoff = tuning.backoff_seconds(runtime.reconnect_attempt - 1)
         logger.error(
             "kafka_reconnect_failed",
             error=str(e),
@@ -557,9 +531,9 @@ async def _process_record(
         poison_offsets[tp] = OffsetAndMetadata(record.offset + 1, "")
         return
     if (
-        runtime.spec.expected_message_type is not None
+        runtime.expected_type is not None
         and envelope.type is not None
-        and envelope.type != runtime.spec.expected_message_type
+        and envelope.type != runtime.expected_type
     ):
         await _quarantine_type_mismatch(runtime, record, envelope)
         tp = TopicPartition(record.topic, record.partition)
@@ -577,7 +551,7 @@ async def _process_record(
         )
     )
     runtime.metrics.consumed.record(1)  # 合法消息才计入消费速率
-    _note_backlog_ts(runtime, record.timestamp)  # 追最老未落库消息
+    _note_backlog_ts(runtime, record.timestamp)  # 追最老未处理消息
 
 
 async def _consume_records(
@@ -598,18 +572,18 @@ async def _consume_records(
             logger.warning("poison_offset_commit_failed", error=str(e))
 
 
-async def _periodic_backlog_check(runtime: ConsumeRuntime, config: ConsumerConfig) -> None:
-    """周期性积压/池指标检查（含 paused 状态，DB 故障期最需要）+ lag 真实化。"""
+async def _periodic_backlog_check(runtime: ConsumeRuntime) -> None:
+    """周期性积压/池指标检查（含 paused 状态，出口故障期最需要）+ lag 真实化。"""
     now_dt = datetime.now(timezone.utc)
     if (
         runtime.last_backlog_check_at is not None
         and (now_dt - runtime.last_backlog_check_at).total_seconds()
-        < config.backlog_check_interval_seconds
+        < runtime.tuning.backlog_check_interval
     ):
         return
     runtime.last_backlog_check_at = now_dt
     _check_backlog_age(runtime)
-    # R4：lag 真实化（与积压检查同周期计算，健康接口只读缓存值）
+    # lag 真实化（与积压检查同周期计算，健康接口只读缓存值）
     consumer = runtime.consumer
     if consumer is not None:
         try:
@@ -620,32 +594,31 @@ async def _periodic_backlog_check(runtime: ConsumeRuntime, config: ConsumerConfi
 
 async def consume_loop(runtime: ConsumeRuntime) -> None:
     """主消费循环。"""
-    config = runtime.consumer_config
     runtime.running = True
-    # 初始化为当前时间，避免首批消息不足 batch_size 时超时检查因 last_write_at=None 永不触发
-    runtime.last_write_at = datetime.now(timezone.utc)
+    # 初始化为当前时间，避免首批消息不足 batch_size 时超时检查因 last_handle_at=None 永不触发
+    runtime.last_handle_at = datetime.now(timezone.utc)
 
     logger.info(
         "consumer_loop_started",
-        group_id=config.group_id,
-        batch_size=config.batch_size,
-        batch_timeout=config.batch_timeout_seconds,
+        group_id=runtime.group_id,
+        batch_size=runtime.batch_size,
+        flush_timeout=runtime.flush_timeout_seconds,
     )
 
     while runtime.running:
-        await _periodic_backlog_check(runtime, config)
+        await _periodic_backlog_check(runtime)
 
         if runtime.paused:
-            # 暂停状态下尝试恢复写库（指数退避，上限 reconnect_max_backoff_seconds）
+            # 暂停状态下尝试恢复处理（指数退避，上限 reconnect_max）
             await _paused_recovery_tick(runtime)
             continue
 
-        # 若 consumer 未启动，尝试重连（指数退避，上限 reconnect_max_backoff_seconds）
+        # 若 consumer 未启动，尝试重连（指数退避，上限 reconnect_max）
         if not await _ensure_consumer_ready(runtime):
             continue
 
-        # 检查是否该触发写入（超时）
-        if _write_timeout_due(runtime) and not await _trigger_write(runtime):
+        # 检查是否该触发批处理（超时）
+        if _flush_timeout_due(runtime) and not await _trigger_flush(runtime):
             continue
 
         # 拉取消息
@@ -653,14 +626,14 @@ async def consume_loop(runtime: ConsumeRuntime) -> None:
         if records is not None:
             await _consume_records(runtime, records)
 
-        # 检查是否该触发写入（条数）
-        if len(runtime.buffer) >= config.batch_size:
-            await _trigger_write(runtime)
+        # 检查是否该触发批处理（条数）
+        if len(runtime.buffer) >= runtime.batch_size:
+            await _trigger_flush(runtime)
 
-    # 优雅停机：写完缓冲区剩余数据
+    # 优雅停机：处理完缓冲区剩余数据
     if runtime.buffer:
         logger.info("shutdown_flushing_buffer", pending=len(runtime.buffer))
-        await _try_write_batch(runtime)
+        await _try_handle_batch(runtime)
 
     logger.info("consumer_loop_stopped")
 

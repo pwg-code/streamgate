@@ -22,7 +22,6 @@ def kafka_config() -> KafkaConfig:
     return KafkaConfig(
         bootstrap_servers=os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),
         topic=os.environ.get("KAFKA__TOPIC", "orders"),
-        dlq_topic=os.environ.get("KAFKA__DLQ_TOPIC", "orders-dlq"),
     )
 
 
@@ -47,7 +46,7 @@ async def main() -> None:
         for order_id in ("o-1", "o-2"):
             outcome = await gateway.process(
                 OrderIn(order_id=order_id, amount=19.9),
-                source="sqlite-sink-produce",
+                source="sqlite-upsert-produce",
             )
             print(f"{order_id}: {outcome.kind.value}")
     finally:

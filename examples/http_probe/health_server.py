@@ -6,11 +6,11 @@
 
 import asyncio
 
-from streamgate import ConsumerWorker, logger
+from streamgate import Consumer, logger
 
 
-async def serve_consumer_health(worker: ConsumerWorker, port: int) -> None:
-    """后台托管 GET /health：返回 worker.health_snapshot() 的 JSON。"""
+async def serve_consumer_health(consumer: Consumer, port: int) -> None:
+    """后台托管 GET /health：返回 consumer.health_snapshot() 的 JSON。"""
 
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -25,7 +25,7 @@ async def serve_consumer_health(worker: ConsumerWorker, port: int) -> None:
                 body = b'{"error": "not found"}'
                 status = "404 Not Found"
             else:
-                snapshot = await worker.health_snapshot()
+                snapshot = await consumer.health_snapshot()
                 body = snapshot.model_dump_json().encode("utf-8")
                 status = "200 OK"
             writer.write(

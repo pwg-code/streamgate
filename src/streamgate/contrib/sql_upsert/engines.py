@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from streamgate import logger
-from streamgate.contrib.sql_sink.config import DbConfig
+from streamgate.contrib.sql_upsert.config import DbConfig
 
 
 def make_query_timeout_hook(timeout_seconds: int):

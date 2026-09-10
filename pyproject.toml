@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "streamgate"
 dynamic = ["version"]
-description = "A pure-core Kafka data pipeline framework: conditional admission, reliable delivery, pluggable sinks via typed hooks."
+description = "A pure-core Kafka data pipeline framework: conditional admission, reliable delivery, and one obvious consume-loop outlet via a typed handler."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -18,7 +18,7 @@ keywords = [
     "dlq",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",

@@ -47,7 +47,7 @@ def build_binding() -> IngestBinding[OrderIn]:
 def build_admission() -> RedisExistenceAdmission[OrderIn]:
     """存在性判定 + 原子占位：注入共享存储载体。
 
-    需要冷实体回源时传 backfill=SqlBackfill(...)（streamgate.contrib.sql_sink）。
+    需要冷实体回源时传 backfill=SqlBackfill(...)（streamgate.contrib.sql_upsert）。
     """
     redis_config = RedisConfig(
         url=os.environ.get("REDIS__URL", "redis://localhost:6379/0")

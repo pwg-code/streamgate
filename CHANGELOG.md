@@ -5,6 +5,154 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-09-10
+
+### BREAKING — consumer side redesigned as a "data outlet"
+
+The consumer API stopped modeling "persistence" and now models what it always
+was: a consume loop. You hand it a handler; offsets, retries, self-healing,
+poison isolation and graceful shutdown are the framework's job. Single-record
+vs. batch is just `batch_size=1` vs `batch_size=N`.
+
+**Migration guide (old → new):**
+
+Constructing the consumer:
+
+```text
+old: ConsumeSpec(on_record=h) + ConsumerWorker(spec, kafka_config=..., consumer_config=...)
+new: Consumer(bootstrap_servers=..., topic=..., group_id=..., handler=h)
+
+old: ConsumeSpec(sink=UpsertWriter(...)) + ConsumerWorker(..., error_classifier=...)
+new (out-of-the-box): SqliteConsumer(db=..., upserts=[...], topic=..., group_id=...)
+new (self-assembled): Consumer(..., handler=h, probe=p,
+                              options=ConsumerOptions(classifier=...))
+
+old: batch_size=1 (on ConsumerConfig)
+new: Consumer(..., batch_size=1)
+```
+
+API renames / removals:
+
+| 0.x | 1.0.0 |
+|-----|-------|
+| `ConsumerWorker(spec, kafka_config=..., consumer_config=..., ...)` | `Consumer(bootstrap_servers, topic, group_id, handler, batch_size, flush_timeout, options)` |
+| `ConsumeSpec` (deleted) | flat constructor arguments + `ConsumerOptions` |
+| `RecordWriter` protocol + `WriteResult` (retired) | `BatchHandler = (batch, context) -> None` — the only outlet contract |
+| `RecordHandler` alias | `BatchHandler` |
+| — | `Probe = (record) -> None` (single-record probe for precise DLQ location) |
+| `ConsumerConfig` (deleted) | flat arguments + `ConsumerOptions.tuning` / `options.dlq` |
+| `ConsumeSpec.expected_message_type` | `ConsumerOptions.expected_type` |
+| `ConsumeSpec.persist_policy` | `ConsumerOptions.persist_hook` |
+| `ConsumeSpec.collapse_key` / `log_context` | `ConsumerOptions.collapse_key` / `log_context` |
+| `ConsumeSpec.dlq` / `dlq_topic` / `dlq_message_type` | `ConsumerOptions.dlq.enabled` / `.topic` / `.message_type` |
+| `ConsumerWorker.error_classifier` | `ConsumerOptions.classifier` |
+| `ConsumerWorker.codec` | `ConsumerOptions.codec` |
+| `ConsumerWorker.cache` | `ConsumerOptions.health_probe` |
+| `ConsumerWorker.existence_ttl_seconds` | `ConsumerOptions.backlog_ttl_seconds` |
+| `ConsumerWorker.metrics_config` | `ConsumerOptions.metrics_window_seconds` |
+| `ConsumerConfig.batch_timeout_seconds` | `flush_timeout` argument / `CONSUMER__FLUSH_TIMEOUT_SECONDS` |
+| `ConsumerConfig.reconnect_base_backoff_seconds` / `reconnect_max_backoff_seconds` | `RuntimeTuning.reconnect_base` / `.reconnect_max` |
+| `ConsumerConfig.backlog_check_interval_seconds` | `RuntimeTuning.backlog_check_interval` |
+| `KafkaConfig.dlq_topic` | `DlqOptions.topic` / env `KAFKA__DLQ_TOPIC` |
+| `BisectOutcome.written` | `BisectOutcome.handled` |
+| `locate_and_write(writer, ...)` | `locate_and_quarantine(probe, ...)` |
+| `DlqProducer(kafka_config, ...)` | `DlqProducer(bootstrap_servers, topic=..., send_retries=..., ...)` |
+| `KafkaConsumerService(kafka_config, consumer_config, topic)` | `KafkaConsumerService(bootstrap_servers, topic, group_id, auto_offset_reset=..., ...)` |
+
+Environment variables:
+
+| 0.x | 1.0.0 |
+|-----|-------|
+| `CONSUMER__BATCH_TIMEOUT_SECONDS` | renamed to `CONSUMER__FLUSH_TIMEOUT_SECONDS` |
+| all other `KAFKA__*` / `CONSUMER__*` / `METRICS__*` keys | unchanged (now read directly by `Consumer` as fallbacks: `KAFKA__BOOTSTRAP_SERVERS`, `KAFKA__TOPIC`, `CONSUMER__GROUP_ID`, `CONSUMER__BATCH_SIZE`, DLQ and tuning keys) |
+
+Health-snapshot metrics:
+
+| 0.x | 1.0.0 |
+|-----|-------|
+| `ConsumerHealthResponse.database` | `output` (outlet connectivity; outlet without an observable carrier reads `connected`) |
+| `sink_write_rate` | `handle_rate` |
+| `sink_write_failure_rate` | `handle_failure_rate` |
+| `sink_write_latency_ms_avg` / `_max` | `handle_latency_ms_avg` / `_max` |
+| `consume_rate` / `retry_rate` | unchanged |
+
+Log events:
+
+| 0.x | 1.0.0 |
+|-----|-------|
+| `batch_write_start` | `batch_handle_start` |
+| `batch_write_success` | `batch_handle_success` |
+| `batch_write_failed` | `batch_handle_failed` |
+| `batch_write_exhausted_retries` | `batch_handle_exhausted_retries` |
+| `batch_write_success_with_quarantine` | `batch_handle_success_with_quarantine` |
+| `consumer_paused_due_to_write_failures` | `consumer_paused_due_to_handle_failures` |
+| `offset_commit_failed_after_write` | `offset_commit_failed_after_handle` |
+| `write_failure_classified` | `handle_failure_classified` |
+| `batch_bisect_triggered` / `bisect_aborted_probe_failed` / `consumer_record_quarantined` | unchanged |
+| `existence_ttl_seconds` log field | `backlog_ttl_seconds` |
+
+Import paths:
+
+| 0.x | 1.0.0 |
+|-----|-------|
+| `streamgate.contrib.sql_sink` | `streamgate.contrib.sql_upsert` (base: `Upsert`, `upsert_outlet`, engine factory, `SqlBackfill`, `SQLAlchemyErrorClassifier`, `DbConfig`) |
+| `streamgate.contrib.sqlite_sink` | `streamgate.contrib.sqlite_upsert` (exports `SqliteConsumer` factory) |
+| `streamgate.contrib.mssql_sink` | `streamgate.contrib.mssql_upsert` (exports `MssqlConsumer` factory) |
+| `UpsertWriter` (retired) | `upsert_outlet(db, upserts) -> tuple[BatchHandler, Probe]` |
+
+No compatibility shims are provided (consistent with a major boundary);
+passing a retired keyword to `Consumer` raises a `TypeError` that points to
+this section.
+
+### Added
+
+- **`Consumer`** — the flat, embeddable consume loop: four required arguments
+  answer "which cluster / which topic / which identity / where data goes";
+  `batch_size` (default 500) and `flush_timeout` (default 5.0s) are
+  first-class; everything else lives in `ConsumerOptions` (with nested
+  `DlqOptions` and `RuntimeTuning`) and defaults to zero conceptual load.
+  Required settings fall back to environment variables (12-factor):
+  `KAFKA__BOOTSTRAP_SERVERS` / `KAFKA__TOPIC` / `CONSUMER__GROUP_ID` (the
+  handler is code-only by design).
+- **Single-record probe (`ConsumerOptions.probe`)** — neutral primitive for
+  precise poison isolation: when a handler raises a POISON-classified error
+  and a probe is provided, the framework re-runs the probe per record
+  (with reference comparison to distinguish data poison from outlet
+  failure); probe-successful records count as handled and commit, probe-
+  failing records are quarantined to the DLQ individually. Without a probe
+  the whole batch is quarantined (offsets still commit, no poison retries).
+  With the DLQ disabled the legacy paused self-healing applies.
+- **`SqliteConsumer` / `MssqlConsumer` factories** — pre-assembled `Consumer`s
+  for the SQL outlet: batch upsert handler + single-record probe + dialect
+  error classifier wired, user `options` merged field-by-field over factory
+  defaults. They return the core `Consumer` (no subclass hierarchy). SQLite
+  auto-creates tables at start (unchanged); MSSQL schema stays with your
+  migration tool.
+- Old parameter names passed to `Consumer` fail with a `TypeError` carrying
+  a migration hint.
+
+### Changed
+
+- Poison handling is probe-based instead of write-batch bisection: location
+  calls the user probe record-by-record with reference verification; the
+  safety invariants are unchanged (probe-failed entries are never
+  quarantined; a suspected outlet failure aborts location and pauses —
+  handled entries are idempotently re-processed on the next pass).
+- `ConsumerHealthResponse` / `ConsumeMetrics` vocabulary neutralized to
+  handle-rate/handle-latency (mapping tables above); the ingest-side metrics
+  and `IngestHealthResponse` are unchanged.
+- Handler objects (callables implementing `__call__`) may opt into framework-
+  managed lifecycle via duck-typed `start()` / `close()` and into the health
+  snapshot via `check_health()` (used by the SQL outlet to report
+  `output` connectivity).
+
+### Removed
+
+- `ConsumeSpec`, `RecordWriter`, `WriteResult`, `RecordHandler`,
+  `ConsumerWorker`, `ConsumerConfig`, `KafkaConfig.dlq_topic`,
+  `contrib.sql_sink` / `contrib.sqlite_sink` / `contrib.mssql_sink`
+  (renamed — see import mapping above).
+
 ## [0.5.0] - 2026-09-10
 
 ### Added

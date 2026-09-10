@@ -7,7 +7,6 @@ from aiokafka.consumer.group_coordinator import GroupCoordinator
 from aiokafka.errors import CommitFailedError, KafkaConnectionError, KafkaError
 from aiokafka.structs import ConsumerRecord, OffsetAndMetadata, TopicPartition
 
-from streamgate.config import ConsumerConfig, KafkaConfig
 from streamgate.obs.logging import logger
 
 # 反序列化后的消息形态：value_deserializer 产 str（tombstone 为 None），
@@ -18,21 +17,31 @@ KafkaRecord = ConsumerRecord[str | None, str | None]
 class KafkaConsumerService:
     def __init__(
         self,
-        kafka_config: KafkaConfig,
-        consumer_config: ConsumerConfig,
-        topic: str | None = None,
+        bootstrap_servers: str,
+        topic: str,
+        group_id: str,
+        *,
+        auto_offset_reset: str = "earliest",
+        max_poll_records: int = 500,
+        session_timeout_ms: int = 30000,
+        max_poll_interval_ms: int = 300000,
     ) -> None:
-        self._kafka_config = kafka_config
-        self._consumer_config = consumer_config
-        self._topic = topic or kafka_config.topic
+        self._bootstrap_servers = bootstrap_servers
+        self._group_id = group_id
+        self._topic = topic
         if not self._topic:
             raise ValueError(
-                "kafka topic is required: set KafkaConfig.topic or pass topic explicitly"
+                "kafka topic is required: pass topic= or set KAFKA__TOPIC"
             )
-        if not consumer_config.group_id:
+        if not group_id:
             raise ValueError(
-                "consumer group_id is required: set ConsumerConfig.group_id"
+                "consumer group_id is required: pass group_id= "
+                "or set CONSUMER__GROUP_ID"
             )
+        self._auto_offset_reset = auto_offset_reset
+        self._max_poll_records = max_poll_records
+        self._session_timeout_ms = session_timeout_ms
+        self._max_poll_interval_ms = max_poll_interval_ms
         self._consumer: AIOKafkaConsumer | None = None
         self._started: bool = False
         self._lag: int = 0
@@ -42,13 +51,13 @@ class KafkaConsumerService:
             return
         self._consumer = AIOKafkaConsumer(
             self._topic,
-            bootstrap_servers=self._kafka_config.bootstrap_servers,
-            group_id=self._consumer_config.group_id,
+            bootstrap_servers=self._bootstrap_servers,
+            group_id=self._group_id,
             enable_auto_commit=False,
-            auto_offset_reset=self._consumer_config.auto_offset_reset,
-            max_poll_records=self._consumer_config.max_poll_records,
-            session_timeout_ms=self._consumer_config.session_timeout_ms,
-            max_poll_interval_ms=self._consumer_config.max_poll_interval_ms,
+            auto_offset_reset=self._auto_offset_reset,
+            max_poll_records=self._max_poll_records,
+            session_timeout_ms=self._session_timeout_ms,
+            max_poll_interval_ms=self._max_poll_interval_ms,
             value_deserializer=lambda v: v.decode("utf-8") if v else v,
             key_deserializer=lambda k: k.decode("utf-8") if k else k,
         )
@@ -63,15 +72,15 @@ class KafkaConsumerService:
             logger.error(
                 event,
                 error=str(e),
-                bootstrap_servers=self._kafka_config.bootstrap_servers,
+                bootstrap_servers=self._bootstrap_servers,
             )
             await self._close_safely()
             raise
         self._started = True
         logger.info(
             "kafka_connected",
-            bootstrap_servers=self._kafka_config.bootstrap_servers,
-            group_id=self._consumer_config.group_id,
+            bootstrap_servers=self._bootstrap_servers,
+            group_id=self._group_id,
             topic=self._topic,
         )
 
@@ -103,7 +112,7 @@ class KafkaConsumerService:
         try:
             result = await self._consumer.getmany(
                 timeout_ms=1000,
-                max_records=self._consumer_config.max_poll_records,
+                max_records=self._max_poll_records,
             )
         except KafkaError as e:
             logger.error("kafka_poll_failed", error=str(e))

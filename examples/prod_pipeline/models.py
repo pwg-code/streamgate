@@ -1,7 +1,7 @@
-"""示例模型：ingress Schema（pydantic）与落库模型（SQLModel）。
+"""示例模型：ingress Schema（pydantic）与存储模型（SQLModel）。
 
 ingress Schema 归使用方（策略归使用方：entity/slot/summary 语义在此定义）；
-落库模型与 Upsert 声明同为使用方策略（框架核心对此零感知）。
+存储模型与 Upsert 声明同为使用方策略（框架核心对此零感知）。
 """
 
 from pydantic import BaseModel
@@ -16,7 +16,7 @@ class OrderIn(BaseModel):
 
 
 class Order(SQLModel, table=True):
-    """落库模型：order_id 为幂等键（MSSQL MERGE / sqlite ON CONFLICT upsert）。
+    """存储模型：order_id 为幂等键（MSSQL MERGE / sqlite ON CONFLICT upsert）。
 
     表名显式取 orders：MSSQL 方言的 MERGE 语句模板不加方括号，
     保留字表名（如默认类名 order）会直接语法错误。

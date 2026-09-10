@@ -115,7 +115,7 @@ class AdmissionPolicy(Protocol[RecordT]):
         ...
 
     async def on_persisted(self, record: RecordT) -> None:
-        """consumer 落库成功后：权威刷新/TTL 心跳——准入与消费侧的唯一耦合点。
+        """consumer 处理成功后：权威刷新/TTL 心跳——准入与消费侧的唯一耦合点。
         实现应自行兜底异常（best-effort），不得影响消费主链路。"""
         ...
 
@@ -160,38 +160,13 @@ class NoBackfill:
         raise RuntimeError("NoBackfill has no source")
 
 
-# ---- 写入 ----
-
-@dataclass(frozen=True)
-class WriteResult:
-    """write 全成时的计数（键为写入目标名，由实现自定义）；失败以异常表达。"""
-
-    counts: dict[str, int] = field(default_factory=dict)
-
-
-@runtime_checkable
-class RecordWriter(Protocol):
-    async def start(self) -> None:
-        """资源生命周期启动（建表/连接探测等；装配时由框架调用一次）。"""
-        ...
-
-    async def write(self, batch: list[JsonObject]) -> WriteResult:
-        """全成 / 部分成(含坏条定位,由框架编排) / 整批失败(触发 paused)。
-        唯一写原语是幂等 upsert：失败重试与重投均安全。"""
-        ...
-
-    async def close(self) -> None:
-        """释放写侧资源（幂等；停机时由消费运行器调用）。"""
-        ...
-
-
-# ---- 写入失败分类（消费端异常处置的决策输入）----
+# ---- 消费端异常分类（异常处置的决策输入）----
 
 class ErrorKind(str, Enum):
-    """写侧异常的处置路径分类：
+    """消费端异常的处置路径分类：
 
     - RETRY：瞬态错误（超时/连接抖动/限流）→ 退避重试当前批次
-    - POISON：毒消息（内容本身无法落地）→ DLQ 二分隔离
+    - POISON：毒消息（内容本身处理不了）→ DLQ 定位隔离
     - FATAL：致命错误（框架级不可恢复）→ 停机告警
     """
 
@@ -202,7 +177,7 @@ class ErrorKind(str, Enum):
 
 @runtime_checkable
 class ErrorClassifier(Protocol):
-    """写侧异常分类器（ConsumerWorker 注入点）。
+    """消费端异常分类器（ConsumerOptions.classifier 注入点）。
 
     实现必须是纯函数式判定（不产生 I/O、不抛异常）：
     返回 ErrorKind 决定框架对该批失败的处置路径。
@@ -211,7 +186,7 @@ class ErrorClassifier(Protocol):
 
     未注入时框架使用 DefaultErrorClassifier（只认通用异常，
     不认识任何 DB/中间件专有类型；接 DB 的使用方应注入对应分类器，
-    参考实现见 examples/sqlite_sink/）。
+    参考实现见 streamgate.contrib.sql_upsert）。
     """
 
     def classify(self, exc: Exception, attempt: int) -> ErrorKind: ...
@@ -360,11 +335,11 @@ class IngestOutcome:
         )
 
 
-# ---- Tier 2 逃生口：只读消费上下文（位点/commit 不开放）----
+# ---- 出口契约：只读消费上下文（位点/commit 不开放）----
 
 @dataclass(frozen=True)
 class ConsumeContext:
-    """on_record 钩子的只读快照。框架管位点：钩子正常返回即视为整批可提交
+    """handler 的只读快照。框架管位点：handler 正常返回即视为整批处理完成
     （抛异常 = 本批不提交，走既有重试 → paused 自愈）。"""
 
     lag: int = 0
@@ -374,7 +349,19 @@ class ConsumeContext:
     backlog_age_seconds: float | None = None
 
 
-RecordHandler = Callable[[list[JsonObject], ConsumeContext], Awaitable[None]]
+BatchHandler = Callable[[list[JsonObject], ConsumeContext], Awaitable[None]]
+"""批处理出口契约：Consumer 唯一的数据出口。
+
+正常返回 = 整批处理成功（框架提交位点）；抛异常 = 按 ErrorClassifier
+分类处置（RETRY 退避重试 / POISON 定位隔离 / FATAL 停机）。实现须幂等。
+"""
+
+Probe = Callable[[JsonObject], Awaitable[None]]
+"""单条探针：对单条记录执行与 handler 等价的处理动作（ConsumerOptions.probe）。
+
+用于 POISON 批的精确定位：probe 成功 = 该条已处理；抛异常 = 该条无法
+处理（精确隔离进 DLQ）。要求与 handler 幂等同构（框架本就要求幂等）。
+"""
 
 __all__ = [
     "AdmissionPolicy",
@@ -382,6 +369,7 @@ __all__ = [
     "BackfillSource",
     "BackpressureSignal",
     "BackpressureSnapshot",
+    "BatchHandler",
     "ConsumeContext",
     "Decision",
     "DecisionKind",
@@ -393,9 +381,7 @@ __all__ = [
     "MessageCodec",
     "NoBackfill",
     "OutcomeKind",
+    "Probe",
     "ProbeResult",
-    "RecordHandler",
-    "RecordWriter",
     "RejectInfo",
-    "WriteResult",
 ]

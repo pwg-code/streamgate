@@ -2,7 +2,7 @@
 
 RedisExistenceAdmission（AdmissionPolicy 协议实现）+ RedisExistenceCache
 （entity→slot→summary 缓存）+ RedisConfig。配合
-streamgate.contrib.sql_sink.SqlBackfill 可实现冷实体 DB 回源。
+streamgate.contrib.sql_upsert.SqlBackfill 可实现冷实体 DB 回源。
 """
 
 from streamgate.contrib._deps import require_extra_import

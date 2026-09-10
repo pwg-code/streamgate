@@ -139,10 +139,10 @@ class ConsumeMetrics:
 
     def __init__(self, window_seconds: int = 60) -> None:
         self.consumed = RateWindow(window_seconds)
-        self.sink_written = RateWindow(window_seconds)
-        self.sink_write_failed = RateWindow(window_seconds)
+        self.handled = RateWindow(window_seconds)
+        self.handle_failed = RateWindow(window_seconds)
         self.retries = RateWindow(window_seconds)
-        self.sink_write_latency = RateWindow(window_seconds)
+        self.handle_latency = RateWindow(window_seconds)
 
 
 __all__ = ["ConsumeMetrics", "IngestMetrics", "RateWindow"]

@@ -1,6 +1,6 @@
-"""Kafka DLQ（死信队列）producer + bisect 二分定位。
+"""Kafka DLQ（死信队列）producer + 单条探针定位。
 
-消费端隔离单条坏数据的出口：把二分定位判定的坏消息连同失败原因
+消费端隔离单条坏数据的出口：把探针定位判定的坏消息连同失败原因
 完整转发到独立死信 topic，供人工留档/处置（不建自动消费/重放）。
 
 与 ingest 侧 KafkaProducerService 的差异（刻意从简，勿"补齐"）：
@@ -19,9 +19,8 @@ from datetime import datetime, timezone
 
 from aiokafka import AIOKafkaProducer
 
-from streamgate.config import KafkaConfig
 from streamgate.obs.logging import logger
-from streamgate.protocols import ErrorKind, JsonObject, RecordWriter
+from streamgate.protocols import ErrorKind, JsonObject, Probe
 
 DLQ_SEND_RETRY_INTERVAL_SECONDS = 1.0  # 发送尝试间隔（隔离路径不在吞吐热区，固定值即可）
 
@@ -45,7 +44,7 @@ class DlqSendError(RuntimeError):
 
 @dataclass
 class BufferedMessage:
-    """缓冲区条目：data 为解析后的载荷 dict（写库输入），其余字段保留
+    """缓冲区条目：data 为解析后的载荷 dict（handler/probe 输入），其余字段保留
     Kafka 消息源信息（DLQ 隔离时定位原消息、完整转发用）。"""
 
     data: JsonObject
@@ -79,20 +78,23 @@ def build_dlq_payload(
 class DlqProducer:
     def __init__(
         self,
-        kafka_config: KafkaConfig,
+        bootstrap_servers: str,
         *,
         topic: str | None = None,
         send_retries: int = 3,
         message_type: str = "streamgate_dlq",
+        request_timeout_ms: int = 10000,
     ) -> None:
-        self._kafka_config = kafka_config
-        self._topic = topic or kafka_config.dlq_topic
+        self._bootstrap_servers = bootstrap_servers
+        self._topic = topic
         if not self._topic:
             raise ValueError(
-                "dlq topic is required: set KafkaConfig.dlq_topic or pass topic explicitly"
+                "dlq topic is required: set DlqOptions.topic "
+                "or env KAFKA__DLQ_TOPIC"
             )
         self._retries = send_retries
         self._message_type = message_type
+        self._request_timeout_ms = request_timeout_ms
         self._producer: AIOKafkaProducer | None = None
         self._started: bool = False
         self._closed: bool = False
@@ -109,9 +111,9 @@ class DlqProducer:
 
     async def _connect(self) -> None:
         producer = AIOKafkaProducer(
-            bootstrap_servers=self._kafka_config.bootstrap_servers,
+            bootstrap_servers=self._bootstrap_servers,
             acks="all",
-            request_timeout_ms=self._kafka_config.request_timeout_ms,
+            request_timeout_ms=self._request_timeout_ms,
             enable_idempotence=True,
             key_serializer=lambda k: k.encode("utf-8") if isinstance(k, str) else k,
             value_serializer=lambda v: v.encode("utf-8") if isinstance(v, str) else v,
@@ -202,7 +204,7 @@ class DlqProducer:
         )
 
 
-# ---- 二分定位与探针对照——防误隔离的核心 ----
+# ---- 单条探针定位与对照验证——防误隔离的核心 ----
 
 
 @dataclass
@@ -215,14 +217,14 @@ class QuarantinedRecord:
 
 @dataclass
 class BisectOutcome:
-    """定位结果。不变式：完成时 written + quarantined 恰好覆盖传入 batch 的全部条目。"""
+    """定位结果。不变式：完成时 handled + quarantined 恰好覆盖传入 batch 的全部条目。"""
 
-    written: list[BufferedMessage] = field(default_factory=list)
+    handled: list[BufferedMessage] = field(default_factory=list)
     quarantined: list[QuarantinedRecord] = field(default_factory=list)
 
 
-class _BisectAborted(Exception):
-    """探针失败（或无探针可用）：疑似 DB 故障，中止整个定位过程。"""
+class _ProbeAborted(Exception):
+    """对照探针失败：疑似出口组件故障，中止整个定位过程。"""
 
 
 def _original_message(raw_value: str | None) -> JsonObject:
@@ -257,117 +259,112 @@ def _build_quarantine_request(
     )
 
 
-def _pick_probe(
-    probe_pool: list[BufferedMessage],
-    bad: BufferedMessage,
-    written: list[BufferedMessage],
-) -> BufferedMessage | None:
-    """探针选择：优先取本轮定位中已成功写入的记录（已证明 DB 此刻可写），
-    否则取原批内任意另一条；原批只有 1 条（无对照）→ None（由调用方决定：
-    DATA 直接隔离，UNKNOWN 按 DB 故障处理）。"""
-    for m in written:
-        if m is not bad:
-            return m
-    for m in probe_pool:
-        if m is not bad:
-            return m
-    return None
-
-
-async def _isolate_single(
-    writer: RecordWriter,
+async def _quarantine_one(
     dlq: DlqProducer,
     bad: BufferedMessage,
-    probe_pool: list[BufferedMessage],
     category: ErrorKind,
     outcome: BisectOutcome,
-    write_error: str,
+    error: str,
 ) -> None:
-    """单条失败：探针对照后隔离（探针失败 ⟹ 疑似存储故障，中止全局）。
-
-    原批只有 1 条、无同批对照：若分类器已明确判定 POISON（排除了
-    超时/连接等瞬态类），可直接隔离——否则单条坏数据将陷入
-    paused→重试→paused 死循环。非 POISON 分类无法断定存储健康，
-    仍按不变式转 paused（探针保护）。
-    """
-    probe = _pick_probe(probe_pool, bad, outcome.written)
-    if probe is None:
-        if category is ErrorKind.POISON:
-            request = _build_quarantine_request(bad, category, write_error)
-            await dlq.quarantine(request)
-            outcome.quarantined.append(QuarantinedRecord(message=bad, request=request))
-            return
-        raise _BisectAborted(
-            f"no probe available (batch size 1) for offset={bad.offset}"
-        )
-    try:
-        await writer.write([probe.data])
-    except Exception as e:
-        raise _BisectAborted(
-            f"probe write failed, suspected DB failure: {e}"
-        ) from e
-    # 探针成功 ⟹ DB 可写 ⟹ 失败原因是该条数据自身 → 隔离
-    # （隔离失败抛 DlqSendError，向上穿透中止本轮，绝不跳过）
-    request = _build_quarantine_request(bad, category, write_error)
+    """隔离单条（隔离失败抛 DlqSendError，向上穿透中止本轮，绝不跳过）。"""
+    request = _build_quarantine_request(bad, category, error)
     await dlq.quarantine(request)
     outcome.quarantined.append(QuarantinedRecord(message=bad, request=request))
 
 
+async def _probe_reference(
+    probe: Probe,
+    reference: BufferedMessage,
+    bad: BufferedMessage,
+) -> None:
+    """对照验证：对一条已成功处理的记录复跑 probe。
+
+    对照成功 ⟹ 出口此刻可用 ⟹ 失败原因是该条数据自身；
+    对照失败 ⟹ 疑似出口组件故障（误隔离风险）⟹ 中止全局转 paused。
+    """
+    try:
+        await probe(reference.data)
+    except Exception as e:
+        raise _ProbeAborted(
+            f"reference probe failed for offset={reference.offset} "
+            f"(locating offset={bad.offset}), suspected outlet failure: {e}"
+        ) from e
+
+
 async def _locate(
-    writer: RecordWriter,
+    probe: Probe,
     dlq: DlqProducer,
     records: list[BufferedMessage],
-    probe_pool: list[BufferedMessage],
     category: ErrorKind,
     outcome: BisectOutcome,
 ) -> None:
-    """递归定位写入一段记录。
+    """逐条定位一段记录。
 
-    成功：写入并记入 outcome.written；
-    失败：二分前半/后半；单条失败用探针对照后隔离。
-    抛 _BisectAborted（疑似存储故障，中止全局）或 DlqSendError（DLQ 不可用）。
+    每条调用 probe：成功 = 已处理（记入 outcome.handled）；
+    失败 = 该条无法处理，先对照验证（复跑最近一条成功记录；批内尚无
+    成功记录时取下一条作对照，其成功结果同样计入 handled），再精确隔离。
+    批内仅剩 1 条且无对照时：分类器已明确判定 POISON（排除了瞬态类），
+    直接隔离——否则单条坏数据将陷入 paused→重试→paused 死循环。
+    抛 _ProbeAborted（疑似出口故障）或 DlqSendError（DLQ 不可用）。
 
-    定位写入刻意"1 次尝试不重试"：瞬时抖动由探针
-    对照兜底区分，不做退避重试。
+    探针调用刻意"1 次尝试不重试"：瞬时抖动由对照验证兜底区分，
+    不做退避重试。
     """
-    write_error = ""
-    try:
-        await writer.write([m.data for m in records])
-        outcome.written.extend(records)
-        return
-    except Exception as e:
-        write_error = str(e)
+    pending = list(records)
+    reference: BufferedMessage | None = None
+    while pending:
+        record = pending.pop(0)
+        try:
+            await probe(record.data)
+        except Exception as e:
+            bad_error = str(e)
+            if reference is not None:
+                await _probe_reference(probe, reference, record)
+            elif pending:
+                control = pending.pop(0)
+                try:
+                    await probe(control.data)
+                except Exception as ce:
+                    raise _ProbeAborted(
+                        f"reference probe failed for offset={control.offset} "
+                        f"(locating offset={record.offset}), "
+                        f"suspected outlet failure: {ce}"
+                    ) from ce
+                outcome.handled.append(control)
+                reference = control
+            elif category is ErrorKind.POISON:
+                await _quarantine_one(dlq, record, category, outcome, bad_error)
+                continue
+            else:
+                raise _ProbeAborted(
+                    f"no probe reference available (batch size 1) "
+                    f"for offset={record.offset}"
+                )
+            await _quarantine_one(dlq, record, category, outcome, bad_error)
+            continue
+        outcome.handled.append(record)
+        reference = record
 
-    if len(records) == 1:
-        await _isolate_single(
-            writer, dlq, records[0], probe_pool, category, outcome, write_error
-        )
-        return
 
-    mid = len(records) // 2
-    await _locate(writer, dlq, records[:mid], probe_pool, category, outcome)
-    await _locate(writer, dlq, records[mid:], probe_pool, category, outcome)
-
-
-async def locate_and_write(
-    writer: RecordWriter,
+async def locate_and_quarantine(
+    probe: Probe,
     dlq: DlqProducer,
     batch: list[BufferedMessage],
     category: ErrorKind,
     error: str,
 ) -> BisectOutcome | None:
-    """二分定位入口。返回值/异常语义见接口契约；error 为触发定位的原始批级错误，
-    用于运维上下文（真正写进 DLQ 的是各单条自身的新写错误）。"""
+    """单条探针定位入口。error 为触发定位的原始批级错误，用于运维上下文
+    （真正写进 DLQ 的是各单条自身的新失败原因）。"""
     outcome = BisectOutcome()
     try:
-        await _locate(writer, dlq, batch, batch, category, outcome)
-    except _BisectAborted as e:
-        # 探针失败：可能已有部分子批写入 DB（幂等，paused 重试时无害重写），
+        await _locate(probe, dlq, batch, category, outcome)
+    except _ProbeAborted as e:
+        # 对照失败：可能已有部分条目处理完成（幂等，paused 重试时无害重跑），
         # 但本轮绝不隔离任何数据、不推进位点
         logger.error(
             "bisect_aborted_probe_failed",
             batch_size=len(batch),
-            written=len(outcome.written),
+            handled=len(outcome.handled),
             error=str(e),
         )
         return None

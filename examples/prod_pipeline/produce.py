@@ -1,6 +1,6 @@
 """生产拓扑演示：Redis 唯一性准入 + HTTP 探活背压（接收侧）。
 
-三个 contrib 组件一次接全（多实例安全查重 / 动态背压 / MSSQL 落库）：
+三个 contrib 组件一次接全（多实例安全查重 / 动态背压 / MSSQL 出口）：
     pip install "streamgate[redis,sql,http]"
 
 运行（先 docker compose up -d 启动 kafka + redis，再启动 consume.py）：
@@ -39,7 +39,7 @@ def build_admission() -> RedisExistenceAdmission[OrderIn]:
     """共享存储唯一性准入：多实例部署安全。
 
     需要冷实体回源（Redis 数据丢失后向权威库核实而非拒绝）时传
-    backfill=SqlBackfill(...)（streamgate.contrib.sql_sink）。
+    backfill=SqlBackfill(...)（streamgate.contrib.sql_upsert）。
     """
     redis_cfg = RedisConfig(url=os.environ.get("REDIS__URL", "redis://localhost:6379/0"))
     return RedisExistenceAdmission(

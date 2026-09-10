@@ -100,15 +100,15 @@ jobs:
           assert streamgate.__version__
 
           from streamgate import (
-              ConsumeSpec, DefaultErrorClassifier, ErrorKind,
+              Consumer, ConsumerOptions, DefaultErrorClassifier, ErrorKind,
               InMemoryAdmission, IngestBinding, IngestGateway,
               ManualBackpressureSignal,
           )
 
           try:
-              ConsumeSpec()
-          except ValueError as e:
-              assert "sink" in str(e) and "on_record" in str(e)
+              Consumer()
+          except TypeError as e:
+              assert "handler" in str(e)
 
           print("bare-install import smoke OK")
           EOF
