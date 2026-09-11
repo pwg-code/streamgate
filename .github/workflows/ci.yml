@@ -100,15 +100,20 @@ jobs:
           assert streamgate.__version__
 
           from streamgate import (
-              Consumer, ConsumerOptions, DefaultErrorClassifier, ErrorKind,
-              InMemoryAdmission, IngestBinding, IngestGateway,
-              ManualBackpressureSignal,
+              Consumer, ConsumerOptions, DedupOptions, DefaultErrorClassifier,
+              ErrorKind, InMemoryDedupCarrier, ManualBackpressureSignal,
+              Producer, ProducerOptions,
           )
 
           try:
               Consumer()
           except TypeError as e:
               assert "handler" in str(e)
+
+          try:
+              Producer()
+          except ValueError as e:
+              assert "topic is required" in str(e)
 
           print("bare-install import smoke OK")
           EOF
@@ -120,7 +125,7 @@ jobs:
           sleep 15
           KAFKA__BOOTSTRAP_SERVERS=localhost:29092 ../../../bare/bin/python produce.py | tee produce.out
           grep -q "o-1: accepted" produce.out
-          grep -q "o-1: conflict" produce.out   # in-memory uniqueness contract
+          grep -q "o-1: duplicate" produce.out   # in-process dedup contract
           grep -q "o-2: accepted" produce.out
           sleep 20   # allow batch-timeout flush + offset commit
           kill -INT $CONSUMER_PID

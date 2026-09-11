@@ -28,7 +28,7 @@ async def main() -> None:
         options=ProducerOptions(
             message_type="order",
             # 一行开启进程内判重：身份键 = order_id，duplicate 时回给已有摘要
-            dedup=DedupOptions(
+            dedup=DedupOptions[OrderIn](
                 key=lambda r: r.order_id,
                 summary=lambda r: {"amount": r.amount},
             ),
