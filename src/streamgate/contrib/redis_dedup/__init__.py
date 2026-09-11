@@ -24,6 +24,8 @@ try:
     from streamgate.contrib.redis_dedup.config import RedisConfig
     from streamgate.contrib.redis_dedup.group_cache import RedisGroupDedupCache
     from streamgate.contrib.redis_dedup.group_carrier import (
+        GroupLoadOutcome,
+        GroupLoadResult,
         RedisGroupDedupCarrier,
         RedisGroupDedupCarrierConfig,
     )
@@ -32,6 +34,8 @@ except ModuleNotFoundError as e:
 
 __all__ = [
     "ColdPathGateFullError",
+    "GroupLoadOutcome",
+    "GroupLoadResult",
     "RedisConfig",
     "RedisDedupCache",
     "RedisDedupCarrier",

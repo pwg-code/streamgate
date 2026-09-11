@@ -6,8 +6,12 @@
 - 幂等摘要写：HSET + EXPIRE 无条件续期（force / on_persisted / 回填共用）
 - 整组回填 write_group_fields：pipeline 分片写入（分片为纯实现细节，无配置、无上界），
   写后统一 EXPIRE
-- 组存在探测 group_exists：EXISTS。组 key 生命周期不可变：仅"整组回填成功"或
-  "空组确认后首身份占位"两条路径创建 → 组 key 存在 ⇒ 组内判定可信，无需空组哨兵
+- 组存在探测 group_exists：EXISTS。组 key 生命周期不可变：仅"整组回填成功"、
+  "空组确认后首身份占位"、"整组确认空标记 confirm_empty"三条路径创建 →
+  组 key 存在 ⇒ 组状态可信（含"已确认空"负缓存态），判定快路径照常成立
+- "确认空组"以专用 field 标记（_GROUP_EMPTY_MARKER）落 HASH：枚举查询侧
+  group_exists=True 直接零 DB，get_group_fields 过滤该标记返回 {}；判重侧
+  phase 2 快路径不变（field 缺失 = 组内确认无此身份）
 - fail-closed 与否是判重载体的参数，缓存层只如实报告错误
 """
 
@@ -28,6 +32,12 @@ _HEALTH_TIMEOUT_S = 2.0
 
 # 整组回填分片大小（纯实现细节：一次 HSET 的 field 数量上限，非业务配置）
 _WRITE_CHUNK_SIZE = 200
+
+# "整组确认空"负缓存标记：作为独立 field 写入组 HASH，标记该组已获 DB 确认无记录。
+# 组 key 因此存在（group_exists=True），枚举查询侧不再判"冷"反复整组回源；
+# 判定快路径语义不变（field 缺失 = 组内确认无此身份）。取值需保证不可能与
+# 真实组内身份重名。
+_GROUP_EMPTY_MARKER = "__streamgate_group_empty__"
 
 # 原子组内占位（单 key，Cluster 兼容）：命中即返回既有摘要，未命中写入 + TTL
 # KEYS[1]=group key, ARGV=[identity, summary_json, ttl_seconds]
@@ -131,7 +141,7 @@ class RedisGroupDedupCache:
                 self._require_client().hget(self.group_key(group), identity),
             )
         )
-        if raw is None:
+        if raw is None or identity == _GROUP_EMPTY_MARKER:
             return None
         return parse_summary(str(raw))
 
@@ -142,7 +152,11 @@ class RedisGroupDedupCache:
                 self._require_client().hgetall(self.group_key(group)),
             )
         )
-        return {identity: parse_summary(str(payload)) for identity, payload in raw.items()}
+        return {
+            identity: parse_summary(str(payload))
+            for identity, payload in raw.items()
+            if identity != _GROUP_EMPTY_MARKER
+        }
 
     async def get_ttl(self, group: str) -> int:
         return int(
@@ -150,6 +164,8 @@ class RedisGroupDedupCache:
         )
 
     async def group_exists(self, group: str) -> bool:
+        """组存在探测。组 key 存在 ⇒ 组状态可信（含"已确认空"负缓存态），
+        判定快路径照常成立：field 缺失 = DB 内确认无此身份。"""
         hits = int(
             await self._read(self._require_client().exists(self.group_key(group)))
         )
@@ -207,6 +223,21 @@ class RedisGroupDedupCache:
             pipe.hset(key, mapping=cast("Mapping[str, str]", chunk))  # type: ignore[reportArgumentType]
             pipe.expire(key, self._config.group_ttl_seconds)
             await self._write(pipe.execute())
+
+    async def confirm_empty(self, group: str) -> None:
+        """标记"整组确认空"负缓存态：写专用 marker + EXPIRE（TTL 沿用
+        group_ttl_seconds，idle GC）。
+
+        此后 group_exists() 为 True（键存在 ⇒ 组状态可信，可能为空）且
+        get_group_fields() 返回 {}，枚举查询侧不再判"冷"反复整组回源。
+        判重 phase 2 快路径不变：组内 field 缺失 = DB 确认无此身份 → 占位。
+        调用前提由使用方保证：仅在 DB 确认组无记录后调用（写库后无自我失效
+        语义）。
+
+        marker 已被 get_identity_meta / get_group_fields 过滤，不会以真实
+        身份或字段泄漏给上层。
+        """
+        await self.write_summary(group, _GROUP_EMPTY_MARKER, {})
 
     async def delete_group(self, group: str) -> None:
         """删除整组（供告警/运维删键修复）。"""

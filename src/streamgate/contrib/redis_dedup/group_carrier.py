@@ -4,8 +4,11 @@
 - 组键 = HASH（field = 组内身份），以组为单位缓存，整组一次冷回源预热
 - admit 三阶段：组内缓存判定 → 组存在快路径（零 DB）→ 全新组冷回源
   （组级单飞 + 并发闸门）
-- 组 key 生命周期不可变：仅"整组回填成功"或"空组确认后首身份占位"两条路径
-  创建 → 组 key 存在 ⇒ 组内判定可信（无需任何安全阀/开关）
+- 组 key 生命周期不可变：仅"整组回填成功"、"空组确认后首身份占位"、
+  "整组确认空标记（cache.confirm_empty）"三条路径创建 → 组 key 存在 ⇒
+  组状态可信（可能为空），无需任何安全阀/开关
+- load_group_refill(group) 公开"整组冷回源 + 回填建键"原语：复用组级单飞 +
+  并发闸门 + 分片回填（与 admit 阶段3 同一机制），供枚举查询侧复用避免复制
 
 框架保证调用时序：admit → (Kafka 发送) → on_send_success（每次成功，通知型）/
 on_send_failed（每次失败，默认保留占位 TTL 自愈）→ on_force_accepted（仅
@@ -365,6 +368,31 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
             mapping=fields,
         )
 
+    # ---- 公开原语：整组冷回源 + 回填（枚举查询侧复用，避免复制机制）----
+
+    async def load_group_refill(self, group: str) -> GroupLoadOutcome:
+        """整组冷回源 + 回填建键（公开原语，供枚举查询侧复用）。
+
+        与 admit 阶段3 复用同一机制与不变式：
+        - 组级单飞：同组并发首触只回源一次，Future 共享；等待方不悬挂；
+        - 并发闸门：闸门满返回 GATE_FULL 态，不触碰 DB（REJECT 方向）；
+        - 整组分片回填后统一续期；仅整组回填成功才建键（write_group_fields
+          分片写出自动建键），半组/失败不成键、不对外判定。
+
+        返回 GroupLoadOutcome（三态）：
+        - FOUND：组内字段已回填，使用方 get_group_fields(group) 直接命中；
+        - EMPTY：DB 确认组无记录，使用方可选 cache.confirm_empty(group)
+          落"确认空"负缓存，消除后续冷回源；
+        - FAILED / GATE_FULL：不建键，由使用方按策略处置。
+
+        边界：本方法只暴露机制，不纳入枚举查询端点/响应体/HTTP 429-502/
+        source 标签等策略内容（mechanism vs policy）。
+        """
+        outcome = await self._load_group_single_flight(group)
+        if outcome.result is GroupLoadResult.FOUND:
+            await self._backfill_best_effort(group, outcome.mapping)
+        return outcome
+
     # ---- 占位与回填 ----
 
     async def _reserve(
@@ -466,6 +494,7 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
 
 
 __all__ = [
+    "GroupLoadOutcome",
     "GroupLoadResult",
     "RedisGroupDedupCarrier",
     "RedisGroupDedupCarrierConfig",

@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-09-11
+
+### Added
+
+- **`RedisGroupDedupCache.confirm_empty(group)`** — an explicit "confirmed
+  empty" negative-cache state for group keys. Writes a reserved marker field
+  into the group HASH (`_GROUP_EMPTY_MARKER`, TTL follows
+  `group_ttl_seconds`, idle-GC); afterwards `group_exists()` is `True` and
+  `get_group_fields()` returns `{}`, so enumeration queries stop re-sourcing a
+  known-empty group from the DB on every call. `get_identity_meta` /
+  `get_group_fields` filter the marker; `group_exists` semantics are unchanged
+  ("key present ⇒ group state authoritative, possibly empty"). Purely additive
+  — no existing signature changed.
+- **`RedisGroupDedupCarrier.load_group_refill(group)`** — public primitive
+  exposing the whole-group cold load + backfill path for reuse by enumeration
+  (query) sides instead of copying the mechanism: group-level single-flight,
+  concurrency gate, chunked backfill and the "only a successful whole-group
+  backfill creates the key" invariant are all shared with `admit` stage 3. It
+  returns a `GroupLoadOutcome` (`FOUND` / `EMPTY` / `FAILED` / `GATE_FULL`);
+  policy (endpoints, response bodies, HTTP 429/502, `source` labels) stays in
+  the caller's adapter layer. `GroupLoadOutcome` / `GroupLoadResult` are now
+  exported from `streamgate.contrib.redis_dedup`.
+
 ## [2.0.0] - 2026-09-11
 
 ### BREAKING — unified backfill contract (feat!)
