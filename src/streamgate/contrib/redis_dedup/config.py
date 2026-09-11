@@ -9,6 +9,8 @@ from pydantic import BaseModel
 class RedisConfig(BaseModel):
     url: str = "redis://localhost:6379/0"
     key_prefix: str = "streamgate:"
-    identity_ttl_seconds: int = 18000        # 占位/摘要 TTL 5h（idle GC：写即续期回满额）
+    identity_ttl_seconds: int = 18000        # 单键占位/摘要 TTL 5h（idle GC：写即续期回满额）
+    group_key_prefix: str = "dedup_group:"   # 组键前缀（组载体 <prefix>dedup_group:<group>，与单键 STRING 隔离）
+    group_ttl_seconds: int = 18000           # 组 HASH TTL 5h（idle GC：组内任何写即续期回满额）
     socket_timeout_ms: int = 1000            # 查询/校验路径超时
     recv_timeout_ms: int = 500               # 推入路径占位/摘要写超时

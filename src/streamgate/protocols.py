@@ -159,16 +159,23 @@ class DedupCarrier(Protocol[RecordT]):
 
 @runtime_checkable
 class BackfillSource(Protocol):
-    async def load(self, identity: str) -> JsonObject | None:
-        """单身份键冷回源：返回既有摘要 dict；None = 确认不存在；
-        失败抛异常（由判重载体转 REJECT/DEPENDENCY）。"""
+    async def load(self, scope: str) -> dict[str, JsonObject] | None:
+        """统一冷回源：scope 为回源作用域，返回 {identity: summary} 映射。
+
+        - scope = 身份键（单键载体传入）：返回该身份 {identity: summary} 单条目映射，
+          无该身份返回 {}（None 与 {} 等价，判重结果一致）
+        - scope = 组号（组载体传入）：返回该组全量 {identity: summary}；
+          组无记录返回 {}。契约强约束：必须返回整组全量身份集合——
+          "组 key 存在 → field 缺失即无此身份"快路径以此为正确性依据
+        - 失败抛异常（由判重载体转 REJECT/DEPENDENCY）
+        """
         ...
 
 
 class NoBackfill:
     """无回源（纯存储判定）。"""
 
-    async def load(self, identity: str) -> JsonObject | None:
+    async def load(self, scope: str) -> dict[str, JsonObject] | None:
         raise RuntimeError("NoBackfill has no source")
 
 

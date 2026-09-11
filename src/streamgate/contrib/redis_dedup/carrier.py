@@ -243,7 +243,7 @@ class RedisDedupCarrier(Generic[RecordModelT]):
 
         # ---- 阶段 2：冷身份回源（并发闸门；无回源时直接占位）----
         try:
-            backfill_summary = await self._gated_load(identity)
+            backfill_map = await self._gated_load(identity)
         except ColdPathGateFullError:
             logger.warning("cold_path_gate_rejected", **self._context(identity))
             return self._reject_gate_full()
@@ -253,27 +253,28 @@ class RedisDedupCarrier(Generic[RecordModelT]):
             )
             return self._reject_dependency()
 
-        if backfill_summary is not None:
-            await self._backfill_best_effort(identity, backfill_summary)
-            return Decision.duplicate(backfill_summary)
+        if backfill_map is not None and identity in backfill_map:
+            await self._backfill_best_effort(identity, backfill_map[identity])
+            return Decision.duplicate(backfill_map[identity])
 
         # DB 确认空：推入路径直接原子占位
         return await self._reserve(identity, meta)
 
-    async def _gated_load(self, identity: str) -> JsonObject | None:
+    async def _gated_load(self, scope: str) -> dict[str, JsonObject] | None:
         """闸门满时不触碰 DB，立即抛 ColdPathGateFullError。
 
+        回源契约：scope = 身份键（单键载体），返回 {identity: summary} 单条目映射。
         单 event loop 内 locked() 检查与 acquire 之间无 await 点，无竞态窗口
         （asyncio.Semaphore 槽位空闲时 acquire 不挂起）。
         """
         if self._cold_gate is None:
-            logger.info("cold_path_load", **self._context(identity))
-            return await self._backfill.load(identity)
+            logger.info("cold_path_load", **self._context(scope))
+            return await self._backfill.load(scope)
         if self._cold_gate.locked():
-            raise ColdPathGateFullError(identity)
+            raise ColdPathGateFullError(scope)
         async with self._cold_gate:
-            logger.info("cold_path_load", **self._context(identity))
-            return await self._backfill.load(identity)
+            logger.info("cold_path_load", **self._context(scope))
+            return await self._backfill.load(scope)
 
     async def _reserve(
         self, identity: str, meta: JsonObject
@@ -304,7 +305,7 @@ class RedisDedupCarrier(Generic[RecordModelT]):
             error=str(error),
         )
         try:
-            backfill_summary = await self._gated_load(identity)
+            backfill_map = await self._gated_load(identity)
         except ColdPathGateFullError:
             logger.warning("cold_path_gate_rejected", **self._context(identity))
             return self._reject_gate_full()
@@ -315,8 +316,8 @@ class RedisDedupCarrier(Generic[RecordModelT]):
                 error=str(db_err),
             )
             return self._reject_dependency()
-        if backfill_summary is not None:
-            return Decision.duplicate(backfill_summary)
+        if backfill_map is not None and identity in backfill_map:
+            return Decision.duplicate(backfill_map[identity])
         return None
 
     async def _backfill_best_effort(

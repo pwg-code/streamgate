@@ -94,13 +94,17 @@ These are plain constructor arguments (not env-mapped). All belong to
 |-------|---------|-------------|
 | `url` | `redis://localhost:6379/0` | Redis connection URL. |
 | `key_prefix` | `streamgate:` | Key prefix for dedup keys (`<prefix>dedup:<identity>`). |
-| `identity_ttl_seconds` | `18000` | Placeholder/summary TTL (idle-GC heartbeat: every write renews it). |
+| `identity_ttl_seconds` | `18000` | Single-key placeholder/summary TTL (idle-GC heartbeat: every write renews it). |
+| `group_key_prefix` | `dedup_group:` | Group-carrier key prefix (`<prefix>dedup_group:<group>` HASH; type-isolated from the single-key STRING). |
+| `group_ttl_seconds` | `18000` | Group HASH TTL (idle-GC heartbeat: any group write renews it). |
 | `socket_timeout_ms` | `1000` | Read/query path timeout. |
 | `recv_timeout_ms` | `500` | Push path (reserve/summary write) timeout. |
 
 Strategy-level knobs live on `RedisDedupCarrierConfig`
 (`fail_closed_on_unavailable`, `cold_path_max_concurrency`, gate-full /
-unavailable `retry_after` seconds, `log_context` mapping).
+unavailable `retry_after` seconds, `log_context` mapping) and on
+`RedisGroupDedupCarrierConfig` (`group_cold_path_max_concurrency`, same
+family of knobs).
 
 ### `contrib.sql_upsert.DbConfig`
 

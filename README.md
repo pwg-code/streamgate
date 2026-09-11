@@ -126,7 +126,7 @@ The package contains **zero web-framework code** (no fastapi/uvicorn), and the c
 
 | Extra | Install | Subpackage(s) | Provides |
 |-------|---------|---------------|----------|
-| `[redis]` | `pip install "streamgate[redis]"` | `contrib.redis_dedup` | `RedisDedupCarrier` (`DedupCarrier` impl, `guarantee="distributed"`), `RedisDedupCache`, `RedisDedupCarrierConfig`, `RedisConfig` |
+| `[redis]` | `pip install "streamgate[redis]"` | `contrib.redis_dedup` | `RedisDedupCarrier` (`DedupCarrier` impl, `guarantee="distributed"`) + `RedisDedupCache`, and the **group-scoped** `RedisGroupDedupCarrier` + `RedisGroupDedupCache` (whole-group one-shot cold backfill, group single-flight); `RedisDedupCarrierConfig`, `RedisConfig` |
 | `[sql]` | `pip install "streamgate[sql]"` | `contrib.sql_upsert` / `contrib.sqlite_upsert` / `contrib.mssql_upsert` | `Upsert` + `upsert_outlet` (batch handler + single-record probe, SQLite `ON CONFLICT` + MSSQL `MERGE`+HOLDLOCK), `SqliteConsumer` / `MssqlConsumer` pre-assembled factories, engine factory, `SqlBackfill` (`BackfillSource` impl), `SQLAlchemyErrorClassifier`, `DbConfig` |
 | `[http]` | `pip install "streamgate[http]"` | `contrib.http_probe` | `HttpProbeSignal` / `HysteresisController` (`BackpressureSignal` impl with trip/recover hysteresis, fail-closed probing) |
 

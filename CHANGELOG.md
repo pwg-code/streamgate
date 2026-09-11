@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-09-11
+
+### BREAKING — unified backfill contract (feat!)
+
+`BackfillSource.load` / `SqlBackfill.load` now speak one mapped contract:
+
+```text
+await load(scope: str) -> dict[str, JsonObject] | None
+```
+
+where `scope` is an identity key (single-key carriers) or a group id (group
+carriers), and the return is a `{identity: summary}` mapping — `None` and `{}`
+are equivalent (no records).
+
+- old single-summary `None` (confirmed absent) → `{}` / key-not-present
+- old single-summary hit → `{identity: summary}`
+- duplicate / allow judgment paths are preserved verbatim
+
+**Runtime breakage:** external custom `BackfillSource` implementations must
+switch `load`'s return shape to the mapped form. Mechanical migration, no
+other surface changed.
+
+### Added
+
+- **`RedisGroupDedupCarrier`** — a group-scoped `DedupCarrier`
+  (`guarantee="distributed"`) in `streamgate.contrib.redis_dedup`. A group
+  (batch / task / import session) is one Redis HASH
+  (`{prefix}dedup_group:{group}`, field = group-internal identity);
+  `group_key(record)` extracts the group id, `key(record)` the identity.
+  Three-stage admit: in-group HASH hit → group-exists fast path (**zero DB**) →
+  new-group cold load of the **whole group** (group-level single-flight +
+  concurrency gate). The group key's lifecycle is immutable — created only by a
+  successful whole-group backfill or the first placeholder after an
+  empty-group confirm — so a present group key makes in-group judgment
+  authoritative with no safety valve.
+- **`RedisGroupDedupCache`** — HASH storage for the group carrier: atomic
+  per-field Lua placeholder, idempotent HSET+EXPIRE writes, chunked-pipeline
+  whole-group backfill, `group_exists` / `get_group_fields` / `get_ttl` /
+  `delete_group`.
+- **`SqlBackfill(group_column=...)`** — optional group-mode backfill
+  (`WHERE group_column = :scope`, returns the whole group); unset keeps the
+  1.0.0 single-key behavior unchanged.
+- `RedisConfig.group_key_prefix` / `RedisConfig.group_ttl_seconds` for the
+  group HASH keys.
+
+### Notes
+
+- The 1.0.0 single-key `RedisDedupCarrier` / `RedisDedupCache` keep their public
+  API; only their internal consumption of `load` moved to the mapped contract.
+  Both carriers coexist in one Redis instance (`dedup:` STRING vs
+  `dedup_group:` HASH, no type clash).
+- Large active groups: whole-group backfill is chunked internally (implementation
+  detail — no config, no cap). Mind the `group_ttl_seconds` vs write-rate
+  relationship (idle-GC renewal grows the memory watermark of active groups);
+  a low-rate group that crosses its TTL mid-batch simply re-sources once, which
+  is normal self-healing.
+
 ## [1.0.0] - 2026-09-10
 
 ### BREAKING — both sides redesigned as flat entry points

@@ -85,7 +85,7 @@ from streamgate.resilience.health import (
 from streamgate.transport.codec import JsonEnvelopeCodec
 from streamgate.transport.kafka import KafkaConsumerService
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 __all__ = [
     "AllowAllSignal",

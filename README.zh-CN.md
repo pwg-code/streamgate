@@ -194,8 +194,9 @@ producer = Producer(..., options=ProducerOptions(
 from streamgate.protocols import BackfillSource
 
 class MyBackfill:                              # 能力清单只有一个方法
-    async def load(self, identity: str) -> dict | None:
-        ...   # 返回既有摘要 dict；None = 确认不存在
+    async def load(self, scope: str) -> dict[str, dict] | None:
+        ...   # 返回 {identity: summary} 映射；scope = 身份键（单键载体）
+              # 或组号（组载体，须返回该组全量身份）；无记录返回 {}
               # 核实不了就抛异常（按"不确定"处理：宁可拒，不重复）
 
 carrier = MyCarrier(backfill=MyBackfill())      # 回源传给你的载体，不是 Producer！
@@ -241,7 +242,7 @@ producer = Producer(..., options=ProducerOptions(signal=MySignal()))   # 注入�
 
 | Extra | 安装 | 子包 | 给你什么 |
 |---|---|---|---|
-| `[redis]` | `pip install "streamgate[redis]"` | `streamgate.contrib.redis_dedup` | Redis 分布式判重载体（多实例安全，Lua 原子占位/冷回源/fail-closed，`guarantee="distributed"`） |
+| `[redis]` | `pip install "streamgate[redis]"` | `streamgate.contrib.redis_dedup` | Redis 分布式判重载体（多实例安全，Lua 原子占位/冷回源/fail-closed，`guarantee="distributed"`）；单身份键版 `RedisDedupCarrier` + 组版 `RedisGroupDedupCarrier`（组内候选判重） |
 | `[sql]` | `pip install "streamgate[sql]"` | `streamgate.contrib.sqlite_upsert` / `.mssql_upsert` / `.sql_upsert` | SQL 幂等出口全套：`SqliteConsumer` / `MssqlConsumer` 预装配工厂（批量 upsert handler + 单条探针 + 数据库异常分类器三件套）、`upsert_outlet` 原语、引擎工厂、`SqlBackfill` 回源 |
 | `[http]` | `pip install "streamgate[http]"` | `streamgate.contrib.http_probe` | 积压探针 + 磁滞限流状态机（trip/recover 防抖、fail-closed） |
 
@@ -271,6 +272,63 @@ result = await producer.push(order)
 if result.kind == "duplicate":
     ...   # result.summary = 已有记录的摘要
 ```
+
+同一场景，如果判重边界是"组"（批次/任务/导入会话：一个组号 + 组内身份不重复），
+换 **`RedisGroupDedupCarrier`**——组是一整个 HASH，冷路径**整组一次回源预热**，
+组内后续记录纯 Redis 命中，零 DB 查询；只有"全新组"才触发回源（组级单飞合并并发）：
+
+```python
+from streamgate import DedupOptions, Producer, ProducerOptions
+from streamgate.contrib.redis_dedup import (
+    RedisConfig, RedisGroupDedupCache, RedisGroupDedupCarrier,
+)
+
+redis_config = RedisConfig(url="redis://localhost:6379/0")
+producer = Producer(
+    "localhost:29092",
+    topic="orders",
+    options=ProducerOptions(
+        dedup=DedupOptions(
+            key=lambda r: r.order_id,          # 组内身份键声明
+            carrier=RedisGroupDedupCarrier(    # 仅组内判重（组 = 判重完整边界）
+                cache=RedisGroupDedupCache(redis_config),
+                group_key=lambda r: r.batch_no,   # payload 组号（组 → 组内身份 HASH）
+                key=lambda r: r.order_id,
+                summary=lambda r: {"amount": r.amount},
+                redis_config=redis_config,
+            ),
+        ),
+    ),
+)
+result = await producer.push(order)
+if result.kind == "duplicate":
+    ...   # result.summary = 组内既有记录的摘要
+```
+
+组载体搭配 `SqlBackfill` 做冷回源时，只需加一个列名，**整组**一次查回预热：
+
+```python
+from streamgate.contrib.sql_upsert import SqlBackfill
+
+carrier = RedisGroupDedupCarrier(
+    cache=RedisGroupDedupCache(redis_config),
+    group_key=lambda r: r.batch_no,
+    key=lambda r: r.order_id,
+    backfill=SqlBackfill(            # group_column 已设 → 整组回源
+        engine=...,
+        table="orders",
+        key_column="order_id",
+        summary_columns={"amount": "amount"},
+        order_columns=["seq_no"],
+        group_column="batch_no",
+    ),
+)
+```
+
+> **大组注意（仅备注，不构成限制）**：整组回填按 pipeline 分片写入（纯实现细节）；
+> 活跃大组的 Redis 内存水位随 `group_ttl_seconds`（idle-GC 续期）增长；单次回源
+> 查询体积大时留意 `query_wait_seconds`（库内分页由回源实现自定）；写入间隔接近
+> TTL 的低速率组可能在批未结束时过期，触发一次额外回源属正常自愈。
 
 SQL 出口的开箱路径——工厂预接三件套，其余与核心 `Consumer` 完全一致：
 
