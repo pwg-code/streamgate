@@ -1,7 +1,7 @@
 """示例模型：ingress Schema（pydantic）与存储模型（SQLModel）。
 
-ingress Schema 归使用方（策略归使用方：entity/slot/summary 语义在此定义）；
-存储模型与 Upsert 声明同为使用方策略（框架核心对此零感知）。
+ingress Schema 与存储模型归使用方（身份键/摘要/upsert 语义在此定义）；
+框架核心对此零感知。
 """
 
 from pydantic import BaseModel
@@ -9,7 +9,7 @@ from sqlmodel import Field, SQLModel
 
 
 class OrderIn(BaseModel):
-    """接收侧 Schema：使用方完成校验后交给 IngestGateway。"""
+    """接收端 Schema：使用方完成校验后交给 Producer.push()。"""
 
     order_id: str
     amount: float

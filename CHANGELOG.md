@@ -7,12 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - 2026-09-10
 
-### BREAKING — consumer side redesigned as a "data outlet"
+### BREAKING — both sides redesigned as flat entry points
 
-The consumer API stopped modeling "persistence" and now models what it always
-was: a consume loop. You hand it a handler; offsets, retries, self-healing,
-poison isolation and graceful shutdown are the framework's job. Single-record
-vs. batch is just `batch_size=1` vs `batch_size=N`.
+**Consumer side — a "data outlet".** The consumer API stopped modeling
+"persistence" and now models what it always was: a consume loop. You hand it a
+handler; offsets, retries, self-healing, poison isolation and graceful
+shutdown are the framework's job. Single-record vs. batch is just
+`batch_size=1` vs `batch_size=N`.
+
+**Producer side — a "door".** The producer API stopped modeling the
+"entity + slot" business scenario and the two-hop `IngestBinding →
+IngestGateway` assembly. `Producer(bootstrap_servers, topic, key, options)`
+is the whole entry: dedup is opt-in (`DedupOptions`, one line for the
+in-process carrier), backpressure folds into `options`, and the routing key
+(`key=`) is separated from the identity key (`DedupOptions.key`) — they were
+welded together in 0.x and that welding was the root cause of every awkward
+semantic.
 
 **Migration guide (old → new):**
 
@@ -31,7 +41,26 @@ old: batch_size=1 (on ConsumerConfig)
 new: Consumer(..., batch_size=1)
 ```
 
-API renames / removals:
+Constructing the producer:
+
+```text
+old: IngestBinding(...) + IngestGateway(binding=..., kafka_config=..., backpressure_config=...)
+new: Producer(bootstrap_servers=..., topic=..., options=ProducerOptions(...))
+
+old: gateway.process(record, overwrite=True)
+new: producer.push(record, force=True)
+
+old: IngestBinding(admission="in-memory", entity_key=..., slot_key=..., summary=...)
+new: ProducerOptions(dedup=DedupOptions(key=..., summary=...))   # in-process carrier
+
+old: IngestBinding(admission="none")
+new: omit dedup entirely (pure push, zero dedup concepts)
+
+old: outcome = await gateway.process(record); outcome.kind == "conflict"
+new: result = await producer.push(record); result.kind == "duplicate"
+```
+
+API renames / removals (consumer side):
 
 | 0.x | 1.0.0 |
 |-----|-------|
@@ -59,12 +88,50 @@ API renames / removals:
 | `DlqProducer(kafka_config, ...)` | `DlqProducer(bootstrap_servers, topic=..., send_retries=..., ...)` |
 | `KafkaConsumerService(kafka_config, consumer_config, topic)` | `KafkaConsumerService(bootstrap_servers, topic, group_id, auto_offset_reset=..., ...)` |
 
+API renames / removals (producer side):
+
+| 0.x | 1.0.0 |
+|-----|-------|
+| `IngestBinding` (deleted) | flat `Producer` constructor arguments + `ProducerOptions` |
+| `IngestGateway(binding=...)` | `Producer(bootstrap_servers, topic, key, options)` |
+| `IngestGateway.process()` | `Producer.push()` |
+| `IngestOutcome` / `OutcomeKind` | `PushResult` / `PushKind` |
+| `OutcomeKind.CONFLICT` | `PushKind.DUPLICATE` |
+| `OutcomeKind.KAFKA_UNAVAILABLE` | `PushKind.UNAVAILABLE` |
+| `IngestGateway.process(overwrite=True)` / `IngestBinding.is_overwrite` | `Producer.push(force=True)` (per-call, not per-record) |
+| `IngestBinding.entity_key` + `slot_key` | split: `Producer(key=...)` = routing key (ordering); `DedupOptions(key=...)` = identity key (dedup) |
+| `IngestBinding.partition_key` | `Producer(key=...)` |
+| `IngestBinding.message_type` | `ProducerOptions.message_type` (default `streamgate_record`) |
+| `IngestBinding.summary` | `DedupOptions.summary` |
+| `IngestBinding.admission="in-memory"` | `ProducerOptions(dedup=DedupOptions(key=...))` (built-in in-process carrier) |
+| `IngestBinding.admission=<AdmissionPolicy>` | `DedupOptions(carrier=<DedupCarrier>)` |
+| `IngestBinding.log_context` | `ProducerOptions.log_context` |
+| `IngestBinding.request_log_context` | removed (HTTP presentation contract — map it in your adapter) |
+| `IngestBinding.backpressure_error_codes` / `backpressure_default_code` / `backpressure_detail` | removed (core only returns `kind`; HTTP mapping is yours) |
+| `IngestBinding.kafka_unavailable_code` / `kafka_unavailable_detail` | removed (`PushResult.reason` only) |
+| `IngestOutcome.status_code` / `error_code` / `detail` | removed — `PushResult` carries `kind` + `reason` + `retry_after` only |
+| `IngestGateway.health()` → `IngestHealthResponse` | `Producer.health()` → `ProducerHealthResponse` |
+| `AdmissionPolicy` protocol | `DedupCarrier` protocol (same hooks; `RejectInfo` carries `reason` + `retry_after`, no HTTP codes; `on_overwrite_accepted` renamed `on_force_accepted`; new `guarantee` property, self-reported) |
+| `RejectInfo.status_code` / `error_code` / `detail` | removed — `RejectInfo(reason, retry_after, ...)` |
+| `DecisionKind.CONFLICT` | `DecisionKind.DUPLICATE` |
+| `InMemoryAdmission` / `NoAdmission` | built-in `InMemoryDedupCarrier` (auto-selected); `dedup=None` replaces `NoAdmission` |
+| `KafkaProducerService` | internalized into `Producer` (self-healing preserved, class no longer exported) |
+| `streamgate.contrib.redis_admission` | `streamgate.contrib.redis_dedup` |
+| `RedisExistenceAdmission` | `RedisDedupCarrier` (`guarantee="distributed"`; `entity_key`/`slot_key` → single `key`; query endpoint `entity_slots` removed) |
+| `RedisExistenceAdmissionConfig` | `RedisDedupCarrierConfig` (error-code fields removed) |
+| `RedisExistenceCache` | `RedisDedupCache` (identity→summary STRING keys, single-key Lua reserve) |
+| `RedisConfig.existence_ttl_seconds` | `RedisConfig.identity_ttl_seconds` (empty-entity sentinel removed — no entity grouping) |
+| `BackfillSource.load(entity) -> dict[slot, summary]` | `BackfillSource.load(identity) -> summary \| None` |
+| `SqlBackfill(entity_column=..., slot_column=...)` | `SqlBackfill(key_column=...)` (single identity key) |
+| `IngestMetrics` | `ProducerMetrics` (`admission_conflict` → `duplicate`) |
+| `collect_ingest_health` | `collect_producer_health` |
+
 Environment variables:
 
 | 0.x | 1.0.0 |
 |-----|-------|
 | `CONSUMER__BATCH_TIMEOUT_SECONDS` | renamed to `CONSUMER__FLUSH_TIMEOUT_SECONDS` |
-| all other `KAFKA__*` / `CONSUMER__*` / `METRICS__*` keys | unchanged (now read directly by `Consumer` as fallbacks: `KAFKA__BOOTSTRAP_SERVERS`, `KAFKA__TOPIC`, `CONSUMER__GROUP_ID`, `CONSUMER__BATCH_SIZE`, DLQ and tuning keys) |
+| all other `KAFKA__*` / `CONSUMER__*` / `METRICS__*` keys | unchanged (now read directly by `Producer` / `Consumer` as fallbacks: `KAFKA__BOOTSTRAP_SERVERS`, `KAFKA__TOPIC`, `CONSUMER__GROUP_ID`, `CONSUMER__BATCH_SIZE`, DLQ, tuning and metrics-window keys) |
 
 Health-snapshot metrics:
 
@@ -75,8 +142,10 @@ Health-snapshot metrics:
 | `sink_write_failure_rate` | `handle_failure_rate` |
 | `sink_write_latency_ms_avg` / `_max` | `handle_latency_ms_avg` / `_max` |
 | `consume_rate` / `retry_rate` | unchanged |
+| `IngestHealthResponse.receive_rate` | `ProducerHealthResponse.push_rate` |
+| `IngestHealthResponse.admission_conflict_rate` | `ProducerHealthResponse.duplicate_rate` |
 
-Log events:
+Log events (both sides keep stable names; producer-side field renames only):
 
 | 0.x | 1.0.0 |
 |-----|-------|
@@ -90,6 +159,11 @@ Log events:
 | `write_failure_classified` | `handle_failure_classified` |
 | `batch_bisect_triggered` / `bisect_aborted_probe_failed` / `consumer_record_quarantined` | unchanged |
 | `existence_ttl_seconds` log field | `backlog_ttl_seconds` |
+| `ingest_request` field `overwrite` | field `force` (event name unchanged) |
+| `admission_send_success_hook_failed` / `admission_send_failed_hook_failed` | `dedup_send_success_hook_failed` / `dedup_send_failed_hook_failed` |
+| `overwrite_rejected_redis_unavailable` / `overwrite_summary_write_failed` | `force_rejected_redis_unavailable` / `force_summary_write_failed` |
+| `load_entity_failed` / `load_entity_failed_degraded` / `cold_path_db_load` | `load_identity_failed` / `load_identity_failed_degraded` / `cold_path_load` |
+| `ingest_request` / `ingest_conflict` / `ingest_rejected_backpressure` / `kafka_*` | unchanged (the `error_code` field was dropped from push-path rejections) |
 
 Import paths:
 
@@ -99,10 +173,12 @@ Import paths:
 | `streamgate.contrib.sqlite_sink` | `streamgate.contrib.sqlite_upsert` (exports `SqliteConsumer` factory) |
 | `streamgate.contrib.mssql_sink` | `streamgate.contrib.mssql_upsert` (exports `MssqlConsumer` factory) |
 | `UpsertWriter` (retired) | `upsert_outlet(db, upserts) -> tuple[BatchHandler, Probe]` |
+| `streamgate.ingest.gateway` / `streamgate.specs` / `streamgate.ingest.admission` | deleted — use `streamgate.Producer` / `ProducerOptions` / `DedupOptions` |
+| `streamgate.contrib.redis_admission` | `streamgate.contrib.redis_dedup` |
 
 No compatibility shims are provided (consistent with a major boundary);
-passing a retired keyword to `Consumer` raises a `TypeError` that points to
-this section.
+passing a retired keyword to `Consumer` or `Producer` raises a `TypeError`
+that points to this section.
 
 ### Added
 
@@ -114,6 +190,22 @@ this section.
   Required settings fall back to environment variables (12-factor):
   `KAFKA__BOOTSTRAP_SERVERS` / `KAFKA__TOPIC` / `CONSUMER__GROUP_ID` (the
   handler is code-only by design).
+- **`Producer`** — the flat, embeddable push entry: two required arguments
+  (`bootstrap_servers`, `topic`, both with `KAFKA__*` env fallbacks) plus an
+  optional routing `key` (same key ⇒ same partition ⇒ ordered; omitted ⇒
+  round-robin, unordered — documented promise). `push(record, force=False,
+  source=...)` returns a transport-neutral `PushResult` (`accepted` /
+  `duplicate` / `rejected` / `backpressure` / `unavailable`) and never raises
+  runtime exceptions for degraded dependencies. Dedup is opt-in via
+  `ProducerOptions(dedup=DedupOptions(key=...))` — one line enables the
+  built-in in-process carrier (`guarantee="process-local"`); injecting a
+  `DedupCarrier` (e.g. `contrib.redis_dedup.RedisDedupCarrier`,
+  `guarantee="distributed"`) scales the guarantee with your topology. The
+  carrier self-reports its guarantee strength and it surfaces as
+  `PushResult.guarantee` on every result. Rejection windows mean zero writes:
+  no reservation, no shared-store write, no Kafka send. The Kafka
+  connection's self-healing monitor (probing, single-flight rebuild,
+  exponential backoff) is preserved internally — no separate class to manage.
 - **Single-record probe (`ConsumerOptions.probe`)** — neutral primitive for
   precise poison isolation: when a handler raises a POISON-classified error
   and a probe is provided, the framework re-runs the probe per record
@@ -128,8 +220,8 @@ this section.
   defaults. They return the core `Consumer` (no subclass hierarchy). SQLite
   auto-creates tables at start (unchanged); MSSQL schema stays with your
   migration tool.
-- Old parameter names passed to `Consumer` fail with a `TypeError` carrying
-  a migration hint.
+- Old parameter names passed to `Consumer` or `Producer` fail with a
+  `TypeError` carrying a migration hint.
 
 ### Changed
 
@@ -139,12 +231,17 @@ this section.
   quarantined; a suspected outlet failure aborts location and pauses —
   handled entries are idempotently re-processed on the next pass).
 - `ConsumerHealthResponse` / `ConsumeMetrics` vocabulary neutralized to
-  handle-rate/handle-latency (mapping tables above); the ingest-side metrics
-  and `IngestHealthResponse` are unchanged.
+  handle-rate/handle-latency; the producer side follows:
+  `IngestHealthResponse` → `ProducerHealthResponse`,
+  `receive_rate` → `push_rate`, `admission_conflict_rate` → `duplicate_rate`
+  (mapping tables above).
 - Handler objects (callables implementing `__call__`) may opt into framework-
   managed lifecycle via duck-typed `start()` / `close()` and into the health
   snapshot via `check_health()` (used by the SQL outlet to report
   `output` connectivity).
+- Dedup carriers and backpressure signals implementing `start()`/`close()`
+  get framework-managed lifecycles (same duck-typed contract as consumer
+  hooks).
 
 ### Removed
 
@@ -152,6 +249,18 @@ this section.
   `ConsumerWorker`, `ConsumerConfig`, `KafkaConfig.dlq_topic`,
   `contrib.sql_sink` / `contrib.sqlite_sink` / `contrib.mssql_sink`
   (renamed — see import mapping above).
+- Producer side: `IngestBinding`, `IngestGateway`, `IngestOutcome`,
+  `OutcomeKind`, `KafkaProducerService`, `InMemoryAdmission`, `NoAdmission`,
+  the `streamgate.ingest.admission` package, `streamgate.specs`,
+  `IngestRecordT`, and the HTTP-presentation contracts
+  (`status_code` / `error_code` / `detail` fields on results and rejects,
+  `backpressure_error_codes` / `backpressure_default_code` /
+  `backpressure_detail` / `kafka_unavailable_code` /
+  `kafka_unavailable_detail` / `request_log_context`).
+- `contrib.redis_admission` (renamed to `contrib.redis_dedup` — see import
+  mapping above; the per-entity query endpoint `entity_slots` and the
+  empty-entity sentinel were not carried over: the single-identity-key model
+  has no entity grouping).
 
 ## [0.5.0] - 2026-09-10
 

@@ -122,12 +122,12 @@ class RateWindow:
         return list(buckets)
 
 
-class IngestMetrics:
-    """ingest 侧滑动窗口指标容器（构造时统一窗长）。"""
+class ProducerMetrics:
+    """生产侧滑动窗口指标容器（构造时统一窗长）。"""
 
     def __init__(self, window_seconds: int = 60) -> None:
         self.received = RateWindow(window_seconds)
-        self.admission_conflict = RateWindow(window_seconds)
+        self.duplicate = RateWindow(window_seconds)
         self.backpressure_rejected = RateWindow(window_seconds)
         self.produce_success = RateWindow(window_seconds)
         self.produce_failure = RateWindow(window_seconds)
@@ -145,4 +145,4 @@ class ConsumeMetrics:
         self.handle_latency = RateWindow(window_seconds)
 
 
-__all__ = ["ConsumeMetrics", "IngestMetrics", "RateWindow"]
+__all__ = ["ConsumeMetrics", "ProducerMetrics", "RateWindow"]

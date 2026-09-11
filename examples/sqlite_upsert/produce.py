@@ -1,4 +1,4 @@
-"""接收端演示：IngestGateway + admission="none"（唯一性准入另见 redis_admission/）。
+"""数据入口演示：最小 Producer（纯推入，零判重概念；判重另见 redis_admission/）。
 
 运行（先 docker compose up -d 启动 Kafka）：
     KAFKA__BOOTSTRAP_SERVERS=localhost:29092 python produce.py
@@ -9,48 +9,27 @@ import os
 
 from models import OrderIn
 
-from streamgate import (
-    BackpressureConfig,
-    IngestBinding,
-    IngestGateway,
-    KafkaConfig,
-)
-
-
-def kafka_config() -> KafkaConfig:
-    """本地默认连 compose 暴露的 host 端口；容器网络内可覆盖为 kafka:9092。"""
-    return KafkaConfig(
-        bootstrap_servers=os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),
-        topic=os.environ.get("KAFKA__TOPIC", "orders"),
-    )
-
-
-def build_binding() -> IngestBinding[OrderIn]:
-    return IngestBinding(
-        message_type="order",
-        entity_key=lambda r: r.order_id,
-        slot_key=lambda r: "order",
-        summary=lambda r: {"amount": r.amount},
-        admission="none",
-    )
+from streamgate import Producer, ProducerOptions
 
 
 async def main() -> None:
-    gateway = IngestGateway(
-        binding=build_binding(),
-        kafka_config=kafka_config(),
-        backpressure_config=BackpressureConfig(enabled=False),
+    producer = Producer(
+        os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),
+        topic=os.environ.get("KAFKA__TOPIC", "orders"),
+        # 传 key 则同 order_id 保序（Kafka 按 key 哈希进同分区）；不传轮询不保序
+        key=lambda r: r.order_id,
+        options=ProducerOptions(message_type="order"),
     )
-    await gateway.start()
+    await producer.start()
     try:
         for order_id in ("o-1", "o-2"):
-            outcome = await gateway.process(
+            result = await producer.push(
                 OrderIn(order_id=order_id, amount=19.9),
                 source="sqlite-upsert-produce",
             )
-            print(f"{order_id}: {outcome.kind.value}")
+            print(f"{order_id}: {result.kind.value}")
     finally:
-        await gateway.close()
+        await producer.close()
 
 
 if __name__ == "__main__":

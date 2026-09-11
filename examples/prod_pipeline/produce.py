@@ -1,11 +1,11 @@
-"""生产拓扑演示：Redis 唯一性准入 + HTTP 探活背压（接收侧）。
+"""生产拓扑演示：Redis 分布式判重 + HTTP 探活背压（数据入口侧）。
 
 三个 contrib 组件一次接全（多实例安全查重 / 动态背压 / MSSQL 出口）：
     pip install "streamgate[redis,sql,http]"
 
 运行（先 docker compose up -d 启动 kafka + redis，再启动 consume.py）：
     KAFKA__BOOTSTRAP_SERVERS=localhost:9092 python produce.py
-重复运行：第二次 o-1 得 CONFLICT（Redis 占位跨进程存活）。
+重复运行：第二次 o-1 得 duplicate（Redis 占位跨进程存活）。
 consume.py 停掉后再运行：探活不可达 → fail-closed 背压拒绝。
 """
 
@@ -14,38 +14,25 @@ import os
 
 from models import OrderIn
 
-from streamgate import (
-    BackpressureConfig,
-    IngestBinding,
-    IngestGateway,
-    KafkaConfig,
-)
+from streamgate import BackpressureConfig, DedupOptions, Producer, ProducerOptions
 from streamgate.contrib.http_probe import HttpProbeSignal
-from streamgate.contrib.redis_admission import (
+from streamgate.contrib.redis_dedup import (
     RedisConfig,
-    RedisExistenceAdmission,
-    RedisExistenceCache,
+    RedisDedupCache,
+    RedisDedupCarrier,
 )
 
 
-def kafka_config() -> KafkaConfig:
-    return KafkaConfig(
-        bootstrap_servers=os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:9092"),
-        topic=os.environ.get("KAFKA__TOPIC", "orders"),
-    )
+def build_carrier() -> RedisDedupCarrier[OrderIn]:
+    """共享存储判重载体：多实例部署安全（guarantee="distributed"）。
 
-
-def build_admission() -> RedisExistenceAdmission[OrderIn]:
-    """共享存储唯一性准入：多实例部署安全。
-
-    需要冷实体回源（Redis 数据丢失后向权威库核实而非拒绝）时传
+    需要冷身份回源（Redis 数据丢失后向权威库核实而非拒绝）时传
     backfill=SqlBackfill(...)（streamgate.contrib.sql_upsert）。
     """
     redis_cfg = RedisConfig(url=os.environ.get("REDIS__URL", "redis://localhost:6379/0"))
-    return RedisExistenceAdmission(
-        cache=RedisExistenceCache(redis_cfg),
-        entity_key=lambda r: r.order_id,
-        slot_key=lambda r: "order",
+    return RedisDedupCarrier(
+        cache=RedisDedupCache(redis_cfg),
+        key=lambda r: r.order_id,
         summary=lambda r: {"amount": r.amount},
         backfill=None,
         redis_config=redis_cfg,
@@ -70,33 +57,30 @@ def backpressure_config() -> BackpressureConfig:
     )
 
 
-def build_binding() -> IngestBinding[OrderIn]:
-    return IngestBinding(
-        message_type="order",
-        entity_key=lambda r: r.order_id,
-        slot_key=lambda r: "order",
-        summary=lambda r: {"amount": r.amount},
-        admission=build_admission(),
-    )
-
-
 async def main() -> None:
-    gateway = IngestGateway(
-        binding=build_binding(),
-        kafka_config=kafka_config(),
-        backpressure_config=backpressure_config(),
-        signal=HttpProbeSignal(backpressure_config()),  # 动态背压注入点
+    producer = Producer(
+        os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:9092"),
+        topic=os.environ.get("KAFKA__TOPIC", "orders"),
+        options=ProducerOptions(
+            message_type="order",
+            dedup=DedupOptions(
+                key=lambda r: r.order_id,  # 身份键声明（载体按同一键判定）
+                carrier=build_carrier(),
+            ),
+            backpressure=backpressure_config(),
+            signal=HttpProbeSignal(backpressure_config()),  # 动态背压注入点
+        ),
     )
-    await gateway.start()
+    await producer.start()
     try:
         for order_id in ("o-1", "o-2"):
-            outcome = await gateway.process(
+            result = await producer.push(
                 OrderIn(order_id=order_id, amount=39.9),
                 source="prod-pipeline-produce",
             )
-            print(f"{order_id}: {outcome.kind.value}")
+            print(f"{order_id}: {result.kind.value} (guarantee={result.guarantee})")
     finally:
-        await gateway.close()
+        await producer.close()
 
 
 if __name__ == "__main__":

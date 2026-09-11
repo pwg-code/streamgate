@@ -11,7 +11,7 @@ from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 
 from streamgate.protocols import (
-    AdmissionPolicy,
+    DedupCarrier,
     ErrorClassifier,
     JsonObject,
     MessageCodec,
@@ -201,7 +201,7 @@ class ConsumerOptions:
       否则整批隔离
     - classifier：异常分类器（RETRY/POISON/FATAL 处置路径）；接 DB 务必注入
       对应分类器（见 streamgate.contrib.sql_upsert）
-    - persist_hook：与 ingest 准入联动的钩子（AdmissionPolicy，处理成功后
+    - persist_hook：与生产侧判重联动的钩子（DedupCarrier，处理成功后
       on_persisted 权威刷新）；生命周期由框架托管（start/close）
     - collapse_key：批内去重键（保留最后一条；作用于钩子通知，不改变 handler 入参）
     - log_context：隔离日志的每条扩展上下文
@@ -217,7 +217,7 @@ class ConsumerOptions:
     expected_type: str | None = None
     probe: Probe | None = None
     classifier: ErrorClassifier | None = None
-    persist_hook: AdmissionPolicy[JsonObject] | None = None
+    persist_hook: DedupCarrier[JsonObject] | None = None
     collapse_key: Callable[[JsonObject], Hashable] | None = None
     log_context: Callable[[JsonObject], JsonObject] | None = None
     codec: MessageCodec | None = None

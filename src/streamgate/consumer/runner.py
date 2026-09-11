@@ -159,8 +159,8 @@ class Consumer:
             return self.runtime
 
         options = self._options
-        # 托管钩子/旁路组件生命周期（AdmissionPolicy 协议契约：框架保证
-        # 调用时序，与 IngestGateway.start() 对齐；handler 实现对象的
+        # 托管钩子/旁路组件生命周期（DedupCarrier 协议契约：框架保证
+        # 调用时序，与 Producer.start() 对齐；handler 实现对象的
         # start()/close() 同步托管）
         if options.persist_hook is not None:
             await _lifecycle_start(options.persist_hook)
@@ -280,7 +280,7 @@ class Consumer:
             await runtime.consumer.stop()
         if runtime.dlq is not None:
             await runtime.dlq.stop()
-        # 钩子先于旁路 health_probe 释放：RedisExistenceAdmission.close() 已
+        # 钩子先于旁路 health_probe 释放：RedisDedupCarrier.close() 已
         # 关闭内部 cache 及 backfill；close() 幂等，双保险亦安全
         if runtime.persist_hook is not None:
             await _lifecycle_close(runtime.persist_hook)

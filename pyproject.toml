@@ -88,7 +88,7 @@ type = "layers"
 layers = [
     "streamgate.contrib",
     "streamgate.ingest | streamgate.consumer",
-    "streamgate.specs | streamgate.transport | streamgate.resilience",
+    "streamgate.transport | streamgate.resilience",
     "streamgate.protocols | streamgate.config | streamgate.obs",
 ]
 

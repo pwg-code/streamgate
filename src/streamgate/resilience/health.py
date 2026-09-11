@@ -13,11 +13,11 @@ from typing import Protocol
 from pydantic import BaseModel, Field
 
 from streamgate.obs.logging import logger
-from streamgate.obs.metrics import ConsumeMetrics, IngestMetrics
+from streamgate.obs.metrics import ConsumeMetrics, ProducerMetrics
 
 
 class _ProducerHealthLike(Protocol):
-    """ingest Kafka producer 的健康观测面（结构化匹配 KafkaProducerService）。
+    """生产侧 Kafka 客户端的健康观测面（结构化匹配 Producer 内部 _KafkaClient）。
 
     以局部协议声明而非 import streamgate.ingest.producer：
     resilience 属基座层，不得依赖进程区（import-linter 门禁）。
@@ -80,8 +80,8 @@ class _ConsumerRuntimeLike(Protocol):
     def metrics(self) -> ConsumeMetrics | None: ...
 
 
-class _AdmissionHealthLike(Protocol):
-    """准入策略的健康观测面（非泛型结构协议：任意 AdmissionPolicy[R] 均满足，
+class _CarrierHealthLike(Protocol):
+    """判重载体的健康观测面（非泛型结构协议：任意 DedupCarrier[R] 均满足，
     规避泛型协议逆变在具体记录型实参下的不可赋值问题）。"""
 
     async def check_cache_health(self) -> bool: ...
@@ -89,7 +89,7 @@ class _AdmissionHealthLike(Protocol):
     async def check_backfill_health(self) -> bool: ...
 
 
-class IngestHealthResponse(BaseModel):
+class ProducerHealthResponse(BaseModel):
     status: str = Field(description="健康状态：healthy / degraded")
     kafka: str = Field(description="Kafka 连接状态：connected / disconnected")
     redis: str = Field(description="Redis 连接状态：connected / disconnected")
@@ -107,13 +107,13 @@ class IngestHealthResponse(BaseModel):
         default=None,
         description="当前掉线持续时长（秒）；未掉线时 null",
     )
-    receive_rate: float = Field(
+    push_rate: float = Field(
         default=0.0,
-        description="近窗口 process() 调用速率（条/秒，含被拒调用，即入口总流量）",
+        description="近窗口 push() 调用速率（条/秒，含被拒调用，即入口总流量）",
     )
-    admission_conflict_rate: float = Field(
+    duplicate_rate: float = Field(
         default=0.0,
-        description="近窗口准入冲突（重复数据）速率（条/秒）",
+        description="近窗口判重命中（重复数据）速率（条/秒）",
     )
     backpressure_reject_rate: float = Field(
         default=0.0,
@@ -211,22 +211,22 @@ async def _probe_component(component: object | None) -> bool | None:
     return bool(await result)
 
 
-def _ingest_health_status(
+def _producer_health_status(
     kafka_healthy: bool, redis_healthy: bool, db_healthy: bool
 ) -> str:
     return "healthy" if (kafka_healthy and redis_healthy and db_healthy) else "degraded"
 
 
-def _ingest_health_response(
+def _producer_health_response(
     kafka: tuple[bool, datetime | None, int, float | None],
     redis_healthy: bool,
     db_healthy: bool,
     timestamp: datetime,
-    metrics: IngestMetrics | None = None,
-) -> IngestHealthResponse:
+    metrics: ProducerMetrics | None = None,
+) -> ProducerHealthResponse:
     """按探测结果构造快照（字段顺序为公共契约）。"""
     kafka_healthy, kafka_last_failure_at, kafka_reconnect_count, kafka_down_duration_seconds = kafka
-    status = _ingest_health_status(kafka_healthy, redis_healthy, db_healthy)
+    status = _producer_health_status(kafka_healthy, redis_healthy, db_healthy)
     logger.debug(
         "health_check",
         status=status,
@@ -235,7 +235,7 @@ def _ingest_health_response(
         database=db_healthy,
     )
     m = metrics
-    return IngestHealthResponse(
+    return ProducerHealthResponse(
         status=status,
         kafka="connected" if kafka_healthy else "disconnected",
         redis="connected" if redis_healthy else "disconnected",
@@ -244,9 +244,9 @@ def _ingest_health_response(
         kafka_last_failure_at=kafka_last_failure_at,
         kafka_reconnect_count=kafka_reconnect_count,
         kafka_down_duration_seconds=kafka_down_duration_seconds,
-        receive_rate=m.received.rate_per_second() if m is not None else 0.0,
-        admission_conflict_rate=(
-            m.admission_conflict.rate_per_second() if m is not None else 0.0
+        push_rate=m.received.rate_per_second() if m is not None else 0.0,
+        duplicate_rate=(
+            m.duplicate.rate_per_second() if m is not None else 0.0
         ),
         backpressure_reject_rate=(
             m.backpressure_rejected.rate_per_second() if m is not None else 0.0
@@ -266,24 +266,24 @@ def _ingest_health_response(
     )
 
 
-async def collect_ingest_health(
+async def collect_producer_health(
     producer: _ProducerHealthLike | None,
-    admission: _AdmissionHealthLike | None,
-    metrics: IngestMetrics | None = None,
-) -> IngestHealthResponse:
-    """ingest 侧健康快照：并发探测 Kafka / Redis / 回源库。
+    carrier: _CarrierHealthLike | None,
+    metrics: ProducerMetrics | None = None,
+) -> ProducerHealthResponse:
+    """生产侧健康快照：并发探测 Kafka / 存储载体 / 回源库。
 
-    metrics：速率指标窗容器（IngestGateway 持有）；未接线时速率字段取默认 0.0。
+    metrics：速率指标窗容器（Producer 持有）；未接线时速率字段取默认 0.0。
     """
     kafka = await _probe_producer(producer)
     redis_task = (
-        admission.check_cache_health() if admission is not None else _absent()
+        carrier.check_cache_health() if carrier is not None else _absent()
     )
     db_task = (
-        admission.check_backfill_health() if admission is not None else _absent()
+        carrier.check_backfill_health() if carrier is not None else _absent()
     )
     redis_healthy, db_healthy = await asyncio.gather(redis_task, db_task)
-    return _ingest_health_response(
+    return _producer_health_response(
         kafka, bool(redis_healthy), bool(db_healthy),
         datetime.now(timezone.utc), metrics,
     )
@@ -361,7 +361,7 @@ async def _probe_kafka(runtime: _ConsumerRuntimeLike) -> bool:
 
 __all__ = [
     "ConsumerHealthResponse",
-    "IngestHealthResponse",
+    "ProducerHealthResponse",
     "collect_consumer_health",
-    "collect_ingest_health",
+    "collect_producer_health",
 ]

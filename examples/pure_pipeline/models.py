@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 
 class OrderIn(BaseModel):
-    """接收侧 Schema：使用方完成校验后交给 IngestGateway。"""
+    """接收端 Schema：使用方完成校验后交给 Producer.push()。"""
 
     order_id: str
     amount: float

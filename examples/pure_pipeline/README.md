@@ -7,9 +7,9 @@ outlet handler upserts SQLite via the Python standard library.
 ## Topology
 
 ```
-produce.py ──► IngestGateway (admission="in-memory") ──► Kafka topic "orders"
-                                                             │
-consume.py ◄─────────────────────────────────────────────────┘
+produce.py ──► Producer (dedup=DedupOptions(key=...)) ──► Kafka topic "orders"
+                                                              │
+consume.py ◄──────────────────────────────────────────────────┘
      └─ Consumer(handler=...) ──► stdlib sqlite3 (data/pipeline.db)
 ```
 
@@ -28,9 +28,9 @@ KAFKA__BOOTSTRAP_SERVERS=localhost:29092 python consume.py
 
 # 4. produce (terminal 2)
 KAFKA__BOOTSTRAP_SERVERS=localhost:29092 python produce.py
-# o-1: accepted
-# o-1: conflict   <- InMemoryAdmission uniqueness (duplicate in the same run)
-# o-2: accepted
+# o-1: accepted (guarantee=process-local)
+# o-1: duplicate <- built-in in-process dedup carrier (same identity in one run)
+# o-2: accepted (guarantee=process-local)
 
 # 5. verify the outlet
 sqlite3 data/pipeline.db "select * from orders;"
@@ -42,17 +42,18 @@ sqlite3 data/pipeline.db "select * from orders;"
 
 | Mechanism | Where |
 |-----------|-------|
-| Declarative ingest (`IngestBinding`) | `produce.py` |
-| Built-in zero-I/O admission (`admission="in-memory"`) | `produce.py` |
-| Default backpressure signal (`ManualBackpressureSignal`) | `produce.py` (implicit) |
+| Flat producer entry (`Producer(bootstrap_servers, topic, options=...)`) | `produce.py` |
+| One-line in-process dedup (`DedupOptions(key=...)`) | `produce.py` |
+| Default backpressure signal (`ManualBackpressureSignal`, off) | `produce.py` (implicit) |
 | Custom outlet (`Consumer(handler=...)`) | `consume.py` |
 | Graceful shutdown (Ctrl+C → flush → leave group) | `consume.py` |
 
 ## Limits (by design)
 
-- `InMemoryAdmission` is **single-process only** — memory is not shared across
-  replicas. For multi-instance deployments inject a shared-storage admission
-  policy; use [`streamgate.contrib.redis_admission`](https://github.com/pwg-code/streamgate#contrib-official-strategy-implementations)
+- The built-in dedup carrier is **single-process only**
+  (`guarantee="process-local"`) — memory is not shared across replicas. For
+  multi-instance deployments inject a shared-storage carrier; use
+  [`streamgate.contrib.redis_dedup`](https://github.com/pwg-code/streamgate#contrib-official-strategy-implementations)
   (see also [`examples/redis_admission/`](../redis_admission/) for a runnable demo).
 - Your `handler` owns the outlet: retries and pausing stay with the framework,
   the storage action is yours. For a pre-assembled SQL outlet with DLQ

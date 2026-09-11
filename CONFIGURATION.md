@@ -1,22 +1,22 @@
 # Configuration reference
 
 streamgate components are configured with typed parameters and Pydantic objects.
-The consumer side takes its required settings as flat constructor arguments with
-environment-variable fallback; the ingest side uses config objects whose fields
-map 1:1 to environment variables using a `PREFIX__field` convention (double
-underscore):
+Both the producer and consumer sides take their required settings as flat
+constructor arguments with environment-variable fallback; advanced knobs are
+folded into options objects whose fields map 1:1 to environment variables using
+a `PREFIX__field` convention (double underscore):
 
-| Prefix | Config object / consumer |
-|--------|--------------------------|
-| `KAFKA__` | `KafkaConfig` (ingest) + `Consumer` fallbacks |
+| Prefix | Config object / component |
+|--------|---------------------------|
+| `KAFKA__` | `KafkaConfig` (via `ProducerOptions.kafka`) + `Consumer` fallbacks |
 | `CONSUMER__` | `Consumer` fallbacks + `ConsumerOptions` |
 | `BACKPRESSURE__` | `BackpressureConfig` |
 | `METRICS__` | metrics window |
 
-**Fallback chain (consumer side):** explicit argument > environment variable >
-built-in default. **Fail-fast semantics:** required settings without a built-in
-default (topic, group id) fail at construction with an error that names the
-setting and how to fix it.
+**Fallback chain (both sides):** explicit argument > environment variable >
+built-in default. **Fail-fast semantics:** required settings without a
+built-in default (topic, group id) fail at construction with an error that
+names the setting and how to fix it.
 
 Database and Redis connection settings are **not part of the core framework**:
 storage carriers are injected and their configuration belongs to your
@@ -44,7 +44,7 @@ ship typed config objects (below) that you construct and pass to the factories.
 | `expected_type` | `None` | Envelope `type` validation (`None` = accept any; mismatched records are quarantined to the DLQ). |
 | `probe` | `None` | Single-record callable with handler-equivalent, idempotent semantics. Provided ⇒ POISON batches are located record-by-record and bad records quarantined precisely; omitted ⇒ the whole batch is quarantined. |
 | `classifier` | `DefaultErrorClassifier` | RETRY/POISON/FATAL mapping for handler exceptions. Connecting a DB? Inject a DB-aware classifier (`contrib.sql_upsert.SQLAlchemyErrorClassifier`). |
-| `persist_hook` | `None` | `AdmissionPolicy` hooked into the consume loop: `on_persisted` runs after each successful batch (ingest linkage). Lifecycle is framework-managed. |
+| `persist_hook` | `None` | `DedupCarrier` hooked into the consume loop: `on_persisted` runs after each successful batch (dedup linkage with the producer side). Lifecycle is framework-managed. |
 | `collapse_key` | `None` | In-batch dedup key (keeps the last record) applied to hook notifications. |
 | `log_context` | `None` | Per-record extra fields for quarantine logs. |
 | `codec` | `JsonEnvelopeCodec` | Message envelope codec. |
@@ -88,21 +88,19 @@ These are plain constructor arguments (not env-mapped). All belong to
 `streamgate.contrib` packages — install the matching extra first
 (`[redis]` / `[sql]` / `[http]`).
 
-### `contrib.redis_admission.RedisConfig`
+### `contrib.redis_dedup.RedisConfig`
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `url` | `redis://localhost:6379/0` | Redis connection URL. |
-| `key_prefix` | `streamgate:` | Key prefix for existence hashes. |
-| `existence_ttl_seconds` | `18000` | Existence hash TTL (idle-GC heartbeat: every write renews it). |
-| `empty_existence_ttl_seconds` | `3600` | Empty-entity sentinel TTL (shorter than existence TTL). |
+| `key_prefix` | `streamgate:` | Key prefix for dedup keys (`<prefix>dedup:<identity>`). |
+| `identity_ttl_seconds` | `18000` | Placeholder/summary TTL (idle-GC heartbeat: every write renews it). |
 | `socket_timeout_ms` | `1000` | Read/query path timeout. |
-| `recv_timeout_ms` | `500` | Ingest path (reserve/summary write) timeout. |
-| `fail_closed_on_unavailable` | `true` | Reject instead of silently degrading when Redis is unavailable (`false` = legacy degraded escape hatch). |
+| `recv_timeout_ms` | `500` | Push path (reserve/summary write) timeout. |
 
-Strategy-level knobs live on `RedisExistenceAdmissionConfig`
+Strategy-level knobs live on `RedisDedupCarrierConfig`
 (`fail_closed_on_unavailable`, `cold_path_max_concurrency`, gate-full /
-unavailable `retry_after` seconds, stable error codes, `log_context` mapping).
+unavailable `retry_after` seconds, `log_context` mapping).
 
 ### `contrib.sql_upsert.DbConfig`
 
@@ -127,21 +125,27 @@ factory entries (`SqliteConsumer` / `MssqlConsumer`).
 
 ---
 
-## KafkaConfig (`KAFKA__*`, ingest side)
+## KafkaConfig (`ProducerOptions.kafka`, `KAFKA__*`)
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `KAFKA__BOOTSTRAP_SERVERS` | `kafka:9092` | Comma-separated broker list. `http://` / `https://` / `kafka://` scheme prefixes are stripped automatically. Also the consumer-side `bootstrap_servers` fallback. |
-| `KAFKA__TOPIC` | **required** | Default topic for the producer (and the consumer-side `topic` fallback). Missing ⇒ startup failure. |
-| `KAFKA__ACKS` | `all` | Producer acks level. |
-| `KAFKA__REQUEST_TIMEOUT_MS` | `10000` | Producer request timeout (ms). |
-| `KAFKA__ENABLE_IDEMPOTENCE` | `true` | Idempotent producer (safe retries). |
-| `KAFKA__HEALTH_CHECK_INTERVAL_SECONDS` | `30.0` | Periodic health probe interval; unhealthy instances are rebuilt. |
-| `KAFKA__RECONNECT_BASE_BACKOFF_SECONDS` | `1.0` | Reconnect exponential backoff base. |
-| `KAFKA__RECONNECT_MAX_BACKOFF_SECONDS` | `30.0` | Reconnect backoff cap. |
-| `KAFKA__RECONNECT_FAILURE_THRESHOLD` | `1` | Consecutive send failures before a rebuild is triggered (raise to tolerate broker jitter). |
-| `KAFKA__SEND_FAILURE_WINDOW_SECONDS` | `30.0` | A send failure within this window marks the instance unhealthy. |
-| `KAFKA__UNHEALTHY_CHECK_INTERVAL_SECONDS` | `5.0` | High-frequency probe interval while unhealthy/rebuilding. |
+The producer takes `bootstrap_servers`/`topic` as flat constructor arguments
+(see `Producer` above); the remaining connection/self-healing knobs live on
+`KafkaConfig`, injectable via `ProducerOptions.kafka` (defaults below).
+`KAFKA__BOOTSTRAP_SERVERS` / `KAFKA__TOPIC` are also the producer-side
+environment fallbacks.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `bootstrap_servers` | `kafka:9092` | Comma-separated broker list. `http://` / `https://` / `kafka://` scheme prefixes are stripped automatically. Always overridden by the `Producer` constructor value. |
+| `topic` | **required** | Topic to push to (constructor value wins). Missing ⇒ construction error. |
+| `acks` | `all` | Producer acks level. |
+| `request_timeout_ms` | `10000` | Producer request timeout (ms). |
+| `enable_idempotence` | `true` | Idempotent producer (safe retries). |
+| `health_check_interval_seconds` | `30.0` | Periodic health probe interval; unhealthy instances are rebuilt. |
+| `reconnect_base_backoff_seconds` | `1.0` | Reconnect exponential backoff base. |
+| `reconnect_max_backoff_seconds` | `30.0` | Reconnect backoff cap. |
+| `reconnect_failure_threshold` | `1` | Consecutive send failures before a rebuild is triggered (raise to tolerate broker jitter). |
+| `send_failure_window_seconds` | `30.0` | A send failure within this window marks the instance unhealthy. |
+| `unhealthy_check_interval_seconds` | `5.0` | High-frequency probe interval while unhealthy/rebuilding. |
 
 The dead-letter topic is configured on the consumer side via
 `DlqOptions.topic` / `KAFKA__DLQ_TOPIC` (see above) — no longer on
@@ -149,8 +153,9 @@ The dead-letter topic is configured on the consumer side via
 
 ## BackpressureConfig (`BACKPRESSURE__*`)
 
-The gateway defaults to the built-in `ManualBackpressureSignal` (static
-switch). For dynamic probing inject your own `BackpressureSignal` —
+The producer defaults to the built-in `ManualBackpressureSignal` (static
+switch, backpressure off). For dynamic probing pass
+`options=ProducerOptions(backpressure=..., signal=...)` —
 `contrib.http_probe.HttpProbeSignal` reads this config object.
 
 | Env var | Default | Description |
@@ -170,9 +175,9 @@ switch). For dynamic probing inject your own `BackpressureSignal` —
 
 ## Metrics window (`METRICS__*`)
 
-Health-snapshot rate metrics: both `IngestGateway` and `Consumer` maintain
+Health-snapshot rate metrics: both `Producer` and `Consumer` maintain
 in-memory sliding windows and expose computed rates / latencies through their
-health snapshots (`receive_rate`, `handle_rate`, `produce_latency_ms_avg`,
+health snapshots (`push_rate`, `handle_rate`, `produce_latency_ms_avg`,
 ...). Windowed aggregates are computed on read — no background tasks, no extra
 endpoint; rates decay to `0.0` once traffic stops for longer than the window.
 

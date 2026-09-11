@@ -25,9 +25,9 @@ from streamgate.consumer.options import ResolvedRuntimeTuning
 from streamgate.obs.logging import logger
 from streamgate.obs.metrics import DEFAULT_METRICS, ConsumeMetrics, MetricsSink
 from streamgate.protocols import (
-    AdmissionPolicy,
     BatchHandler,
     ConsumeContext,
+    DedupCarrier,
     Envelope,
     ErrorClassifier,
     ErrorKind,
@@ -65,7 +65,7 @@ class ConsumeRuntime:
         backlog_ttl_seconds: int,
         consumer: KafkaConsumerService | None,
         codec: MessageCodec,
-        persist_hook: AdmissionPolicy[JsonObject] | None = None,
+        persist_hook: DedupCarrier[JsonObject] | None = None,
         health_probe: object | None = None,
         dlq: DlqProducer | None = None,
         metrics_sink: MetricsSink | None = None,
@@ -167,9 +167,9 @@ def _dedup_by_collapse_key(
 
 
 async def _notify_handled(runtime: ConsumeRuntime, batch: list[BufferedMessage]) -> None:
-    """整批处理成功 → 权威刷新/on_persisted 钩子（best-effort，策略内部兜底异常）。"""
-    policy = runtime.persist_hook
-    if policy is None:
+    """整批处理成功 → 权威刷新/on_persisted 钩子（best-effort，载体内部兜底异常）。"""
+    hook = runtime.persist_hook
+    if hook is None:
         return
     records = (
         _dedup_by_collapse_key(batch, runtime.collapse_key)
@@ -178,7 +178,7 @@ async def _notify_handled(runtime: ConsumeRuntime, batch: list[BufferedMessage])
     )
     for m in records:
         try:
-            await policy.on_persisted(m.data)
+            await hook.on_persisted(m.data)
         except Exception as e:
             logger.warning("on_persisted_failed", error=str(e))
 

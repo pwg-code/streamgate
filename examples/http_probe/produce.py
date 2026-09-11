@@ -1,9 +1,9 @@
-"""接收端演示：注入 HttpProbeSignal —— 消费端积压超阈值时自动拒绝接收。
+"""数据入口演示：注入 HttpProbeSignal —— 消费端积压超阈值时自动拒绝推入。
 
 运行（先启动 consume.py，再运行本脚本）：
     KAFKA__BOOTSTRAP_SERVERS=localhost:29092 python produce.py
 
-依赖：pip install "streamgate[http]"（策略实现已升级为
+依赖：pip install "streamgate[http]"（信号实现见
 streamgate.contrib.http_probe 正式功能）。
 观察：把 consume.py 停掉（探活不可达 → fail-closed 拒绝），或人为调低
 BACKPRESSURE__TRIP_SECONDS 制造积压拒绝；恢复 consume.py 后磁滞放行。
@@ -14,20 +14,8 @@ import os
 
 from models import OrderIn
 
-from streamgate import (
-    BackpressureConfig,
-    IngestBinding,
-    IngestGateway,
-    KafkaConfig,
-)
+from streamgate import BackpressureConfig, Producer, ProducerOptions
 from streamgate.contrib.http_probe import HttpProbeSignal
-
-
-def kafka_config() -> KafkaConfig:
-    return KafkaConfig(
-        bootstrap_servers=os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),
-        topic=os.environ.get("KAFKA__TOPIC", "orders"),
-    )
 
 
 def backpressure_config() -> BackpressureConfig:
@@ -48,33 +36,26 @@ def backpressure_config() -> BackpressureConfig:
     )
 
 
-def build_binding() -> IngestBinding[OrderIn]:
-    return IngestBinding(
-        message_type="order",
-        entity_key=lambda r: r.order_id,
-        slot_key=lambda r: "order",
-        summary=lambda r: {"amount": r.amount},
-        admission="none",
-    )
-
-
 async def main() -> None:
-    gateway = IngestGateway(
-        binding=build_binding(),
-        kafka_config=kafka_config(),
-        backpressure_config=backpressure_config(),
-        signal=HttpProbeSignal(backpressure_config()),  # 背压信号注入点
+    producer = Producer(
+        os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),
+        topic=os.environ.get("KAFKA__TOPIC", "orders"),
+        options=ProducerOptions(
+            message_type="order",
+            backpressure=backpressure_config(),
+            signal=HttpProbeSignal(backpressure_config()),  # 背压信号注入点
+        ),
     )
-    await gateway.start()
+    await producer.start()
     try:
         for i in range(1, 6):
-            outcome = await gateway.process(
+            result = await producer.push(
                 OrderIn(order_id=f"o-{i}", amount=float(i)),
                 source="http-probe-produce",
             )
-            print(f"o-{i}: {outcome.kind.value}")
+            print(f"o-{i}: {result.kind.value}")
     finally:
-        await gateway.close()
+        await producer.close()
 
 
 if __name__ == "__main__":

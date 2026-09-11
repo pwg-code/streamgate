@@ -1,14 +1,14 @@
-# prod_pipeline — production topology: Redis admission + HTTP-probe backpressure + MSSQL outlet
+# prod_pipeline — production topology: Redis dedup + HTTP-probe backpressure + MSSQL outlet
 
 The full production wiring in one runnable demo. Every strategy comes from
 `streamgate.contrib` — install once, import everywhere:
 
-- **Redis uniqueness admission** (`contrib.redis_admission`, extra `[redis]`) —
+- **Redis distributed dedup** (`contrib.redis_dedup`, extra `[redis]`) —
   shared-storage dedup, multi-instance safe (atomic Lua reservation, TTL
-  idle-GC, empty-entity sentinels, fail-closed).
-- **HTTP probe backpressure** (`contrib.http_probe`, extra `[http]`) — ingest
-  rejects when the consumer reports backlog or the health endpoint is
-  unreachable (fail-closed), with trip/recover hysteresis.
+  idle-GC, fail-closed), self-reports `guarantee="distributed"`.
+- **HTTP probe backpressure** (`contrib.http_probe`, extra `[http]`) — the
+  producer rejects pushes when the consumer reports backlog or the health
+  endpoint is unreachable (fail-closed), with trip/recover hysteresis.
 - **MSSQL idempotent outlet** (`contrib.mssql_upsert`, extra `[sql]`) —
   `MssqlConsumer` factory: `MERGE` + HOLDLOCK upsert with the SQL Server
   error-number classifier, batch handler + single-record probe pre-wired.
@@ -19,7 +19,7 @@ The full production wiring in one runnable demo. Every strategy comes from
 
 | Module | Contents |
 |--------|----------|
-| `produce.py` | ingest side: `RedisExistenceAdmission` + `HttpProbeSignal` injection |
+| `produce.py` | producer side: `RedisDedupCarrier` + `HttpProbeSignal` injection |
 | `consume.py` | consumer side: `MssqlConsumer` factory + health endpoint |
 | `health_server.py` | demo-grade stdlib `GET /health` serving `consumer.health_snapshot()` — swap in your web framework for production |
 | `models.py` | ingress schema + storage table (`orders`) |
@@ -44,7 +44,7 @@ KAFKA__BOOTSTRAP_SERVERS=localhost:9092 python produce.py
 # o-1: accepted
 # o-2: accepted
 
-# run produce.py again → o-1: conflict
+# run produce.py again → o-1: duplicate
 #   (Redis reservation survives across processes — multi-instance safe)
 
 # stop consume.py, run produce.py again → fail-closed backpressure:
@@ -53,10 +53,10 @@ KAFKA__BOOTSTRAP_SERVERS=localhost:9092 python produce.py
 
 ## Notes
 
-- **Cold-entity backfill (optional):** pass `backfill=SqlBackfill(...)`
-  (from `contrib.sql_upsert`) to `RedisExistenceAdmission` so cache misses are
+- **Cold-identity backfill (optional):** pass `backfill=SqlBackfill(...)`
+  (from `contrib.sql_upsert`) to `RedisDedupCarrier` so cache misses are
   verified against the database instead of rejected (fail-closed default).
-- **Consumer-side authoritative refresh:** inject the same admission policy
+- **Consumer-side authoritative refresh:** inject the same dedup carrier
   as `ConsumerOptions(persist_hook=...)` so Redis summaries are refreshed
   after each successful batch — see
   [`examples/redis_admission/README.md`](../redis_admission/README.md).

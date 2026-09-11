@@ -285,7 +285,7 @@ class HysteresisController:
 class HttpProbeSignal(HysteresisController):
     """周期探活远端 consumer 健康接口的背压信号（双进程拓扑）。
 
-    用法：注入 IngestGateway(signal=HttpProbeSignal(config))。
+    用法：注入 Producer(options=ProducerOptions(signal=HttpProbeSignal(config)))。
     """
 
     def __init__(

@@ -1,4 +1,4 @@
-"""Tier 1 公共协议（约 7 个，小而稳定，冻结承诺）。
+"""Tier 1 公共协议（小而稳定，冻结承诺）。
 
 机制归框架，策略归使用方：替换任一协议实现即可改变对应策略，
 不要求继承任何框架基类（Protocol + 组合注入）。
@@ -10,37 +10,38 @@ from datetime import datetime
 from enum import Enum
 from typing import Protocol, TypeVar, runtime_checkable
 
-# 记录类型（逆变）：准入策略只消费记录（方法参数位），不生产记录，
-# 因此 AdmissionPolicy[子类型] 可安全赋给 AdmissionPolicy[基类型]。
+# 记录类型（逆变）：判重载体只消费记录（方法参数位），不生产记录，
+# 因此 DedupCarrier[子类型] 可安全赋给 DedupCarrier[基类型]。
 RecordT = TypeVar("RecordT", contravariant=True)
 
 # JSON 载荷统一容器：值域为可 JSON 序列化的对象，具体结构由使用方 Schema 约束。
 JsonObject = dict[str, object]
 
 
-# ---- 准入判定结果 ----
+# ---- 判重判定结果 ----
 
 class DecisionKind(str, Enum):
     ALLOW = "allow"
-    CONFLICT = "conflict"
+    DUPLICATE = "duplicate"
     REJECT = "reject"
 
 
 @dataclass(frozen=True)
 class RejectInfo:
-    """拒绝详情：HTTP 状态/错误码/建议重试间隔 + 观测事件（策略自带语义）。"""
+    """拒绝详情：拒绝原因 + 建议重试间隔 + 观测事件（载体自带语义）。
 
-    status_code: int
-    error_code: str
-    detail: str
+    呈现契约（HTTP 状态码/error_code/文案映射）归使用方适配层，此处不承载。
+    """
+
+    reason: str
     retry_after: int | None = None
-    log_event: str | None = None          # 拒绝时由路由发射的稳定事件名
+    log_event: str | None = None          # 拒绝时由框架发射的稳定事件名
     log_fields: JsonObject = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class Decision:
-    """admit 的判定结果。CONFLICT 时 summary 为既有数据摘要（dict，409 载荷来源）。"""
+    """admit 的判定结果。DUPLICATE 时 summary 为既有记录摘要。"""
 
     kind: DecisionKind
     summary: JsonObject | None = None
@@ -51,8 +52,8 @@ class Decision:
         return cls(DecisionKind.ALLOW)
 
     @classmethod
-    def conflict(cls, summary: JsonObject | None) -> "Decision":
-        return cls(DecisionKind.CONFLICT, summary=summary)
+    def duplicate(cls, summary: JsonObject | None) -> "Decision":
+        return cls(DecisionKind.DUPLICATE, summary=summary)
 
     @classmethod
     def rejected(cls, info: RejectInfo) -> "Decision":
@@ -88,34 +89,45 @@ class MessageCodec(Protocol):
         ...
 
 
-# ---- 准入策略：唯一性契约的两端 + 回源，三者解耦----
+# ---- 判重载体：唯一性契约的存储侧（opt-in，机制归核心 / 载体归使用方）----
 
 @runtime_checkable
-class AdmissionPolicy(Protocol[RecordT]):
-    async def admit(self, record: RecordT, *, overwrite: bool = False) -> Decision:
-        """发送前判定：ALLOW | CONFLICT(既有摘要) | REJECT(status/error_code/retry_after)。
-        overwrite=True 时策略应跳过唯一性判定（409 确认后的完整重发）。"""
+class DedupCarrier(Protocol[RecordT]):
+    """身份判定 + 占位 + 通知钩子 + 健康探测。
+
+    自报保证强度（guarantee）：强度 = 所选载体的强度。进程内载体只有
+    单进程保证，分布式载体才有多实例保证；框架不做部署形态启动期校验。
+    """
+
+    @property
+    def guarantee(self) -> str:
+        """判重保证强度自报（"process-local" | "distributed"），随 PushResult 透出。"""
+        ...
+
+    async def admit(self, record: RecordT, *, force: bool = False) -> Decision:
+        """发送前判定：ALLOW（占位已生效）| DUPLICATE(既有摘要) | REJECT(reason/retry_after)。
+        force=True 时跳过唯一性判定（确认覆盖后的完整重推），实现可只做
+        依赖预检（fail-closed 载体用，防"已发 Kafka 但摘要写失败"半完成态）。"""
         ...
 
     async def on_send_success(self, record: RecordT) -> None:
-        """每次 Kafka 发送成功（broker ack）后调用（含 overwrite 路径；通知型）。
-        非 overwrite 路径占位已在 admit 写入，默认无需动作；实现可做缓存续期等。"""
+        """每次 Kafka 发送成功（broker ack）后调用（含 force 路径；通知型）。
+        非 force 路径占位已在 admit 写入，默认无需动作；实现可做缓存续期等。"""
         ...
 
     async def on_send_failed(self, record: RecordT) -> None:
         """Kafka 发送失败后调用（此时占位可能已写入）。
         框架默认语义是保留占位（防模糊失败重复，靠 TTL/回源自愈）；
-        实现可在此释放占位换取"立即可重发"，自担重复风险。"""
+        实现可在此释放占位换取"立即可重推"，自担重复风险。"""
         ...
 
-    async def on_overwrite_accepted(self, record: RecordT) -> bool:
-        """仅 overwrite 路径、Kafka 成功后：幂等摘要写（失败语义由实现自定）。
-        返回 False 表示"缓存未反映本次记录"（映射到 cache_updated=false）。
-        兼容：旧版策略只实现 on_accepted 时，框架按本钩子语义回退调用。"""
+    async def on_force_accepted(self, record: RecordT) -> bool:
+        """仅 force 路径、Kafka 成功后：幂等摘要写（失败语义由实现自定）。
+        返回 False 表示"存储未反映本次记录"。"""
         ...
 
     async def on_persisted(self, record: RecordT) -> None:
-        """consumer 处理成功后：权威刷新/TTL 心跳——准入与消费侧的唯一耦合点。
+        """consumer 处理成功后：权威刷新/TTL 心跳——判重与消费侧的唯一耦合点。
         实现应自行兜底异常（best-effort），不得影响消费主链路。"""
         ...
 
@@ -128,11 +140,11 @@ class AdmissionPolicy(Protocol[RecordT]):
         ...
 
     async def check_cache_health(self) -> bool:
-        """缓存侧健康（/health 用；无缓存的策略恒 False 或恒 True 由语义自定）。"""
+        """存储侧健康（/health 用；无缓存的载体恒 False 或恒 True 由语义自定）。"""
         ...
 
     async def check_backfill_health(self) -> bool:
-        """回源库健康（/health 用；无回源的策略返回 False）。"""
+        """回源库健康（/health 用；无回源的载体返回 False）。"""
         ...
 
     async def check_backfill_health_detail(self) -> tuple[bool, str | None]:
@@ -141,22 +153,22 @@ class AdmissionPolicy(Protocol[RecordT]):
 
     @property
     def existence_ttl_seconds(self) -> int | None:
-        """缓存 TTL 预算（背压 trip 校验用；无则 None）。"""
+        """占位 TTL 预算（背压 trip 校验用；无则 None）。"""
         ...
 
 
 @runtime_checkable
 class BackfillSource(Protocol):
-    async def load(self, entity: str) -> dict[str, JsonObject]:
-        """冷实体回源：返回 {slot: summary_dict}；空 dict=确认不存在；
-        失败抛异常（由准入策略转 UNDETERMINED/DEPENDENCY）。"""
+    async def load(self, identity: str) -> JsonObject | None:
+        """单身份键冷回源：返回既有摘要 dict；None = 确认不存在；
+        失败抛异常（由判重载体转 REJECT/DEPENDENCY）。"""
         ...
 
 
 class NoBackfill:
-    """无回源（纯缓存判定）。"""
+    """无回源（纯存储判定）。"""
 
-    async def load(self, entity: str) -> dict[str, JsonObject]:
+    async def load(self, identity: str) -> JsonObject | None:
         raise RuntimeError("NoBackfill has no source")
 
 
@@ -196,7 +208,7 @@ class ErrorClassifier(Protocol):
 
 @dataclass(frozen=True)
 class BackpressureSnapshot:
-    """背压只读快照：ingest 路由热路径唯一的判定输入。"""
+    """背压只读快照：push 热路径唯一的判定输入。"""
 
     rejecting: bool
     reason: str | None = None
@@ -243,7 +255,7 @@ class BackpressureSignal(Protocol):
 
 
 class AllowAllSignal:
-    """未接线时的放行哑实现（测试/单组件场景，避免连锁 503）。"""
+    """未接线时的放行哑实现（测试/单组件场景）。"""
 
     rejecting: bool = False
     reject_reason: str | None = None
@@ -259,80 +271,70 @@ class AllowAllSignal:
         return None
 
 
-# ---- 接收判定结果（传输无关；HTTP 映射归使用方适配层）----
+# ---- 推入判定结果（传输无关；呈现层映射归使用方适配层）----
 
-class OutcomeKind(str, Enum):
+class PushKind(str, Enum):
     ACCEPTED = "accepted"
-    CONFLICT = "conflict"
+    DUPLICATE = "duplicate"                  # 已有同身份记录（判重命中）
     BACKPRESSURE = "backpressure"
-    REJECTED = "rejected"                    # 准入策略显式拒绝（带建议状态码）
-    KAFKA_UNAVAILABLE = "kafka_unavailable"  # 发送失败（建议 502）
+    REJECTED = "rejected"                    # 判重载体/策略显式拒绝
+    UNAVAILABLE = "unavailable"              # Kafka 发送失败
 
 
 @dataclass(frozen=True)
-class IngestOutcome:
-    """process() 的判定结果。字段按 kind 取用：
-    ACCEPTED → received_at/cache_updated；CONFLICT → summary；
-    BACKPRESSURE → reason/error_code/detail/retry_after；
-    REJECTED → status_code/error_code/detail/retry_after；
-    KAFKA_UNAVAILABLE → error_code/detail。"""
+class PushResult:
+    """push() 的判定结果。字段按 kind 取用：
+    ACCEPTED → received_at/cache_updated；DUPLICATE → summary；
+    BACKPRESSURE → reason/retry_after；REJECTED → reason/retry_after；
+    UNAVAILABLE → reason。
+    guarantee：判重保证强度（载体自报）；判重未开启时 None。
+    呈现层（HTTP 状态码/error_code/文案）映射归使用方适配层。"""
 
-    kind: OutcomeKind
+    kind: PushKind
+    guarantee: str | None = None
     received_at: datetime | None = None
     cache_updated: bool = True
     summary: JsonObject | None = None
     reason: str | None = None
-    status_code: int | None = None
-    error_code: str | None = None
-    detail: str | None = None
     retry_after: int | None = None
 
     @classmethod
     def accepted(
-        cls, received_at: datetime, *, cache_updated: bool = True
-    ) -> "IngestOutcome":
+        cls, received_at: datetime, *, guarantee: str | None = None
+    ) -> "PushResult":
         return cls(
-            OutcomeKind.ACCEPTED,
-            received_at=received_at,
-            cache_updated=cache_updated,
+            PushKind.ACCEPTED, guarantee=guarantee, received_at=received_at
         )
 
     @classmethod
-    def conflict(cls, summary: JsonObject) -> "IngestOutcome":
-        return cls(OutcomeKind.CONFLICT, summary=summary)
+    def duplicate(
+        cls, summary: JsonObject, *, guarantee: str | None = None
+    ) -> "PushResult":
+        return cls(PushKind.DUPLICATE, guarantee=guarantee, summary=summary)
 
     @classmethod
     def backpressure(
-        cls,
-        reason: str | None,
-        *,
-        error_code: str,
-        detail: str,
-        retry_after: int,
-    ) -> "IngestOutcome":
+        cls, reason: str | None, *, retry_after: int, guarantee: str | None = None
+    ) -> "PushResult":
         return cls(
-            OutcomeKind.BACKPRESSURE,
+            PushKind.BACKPRESSURE,
+            guarantee=guarantee,
             reason=reason,
-            error_code=error_code,
-            detail=detail,
             retry_after=retry_after,
         )
 
     @classmethod
-    def rejected(cls, info: RejectInfo) -> "IngestOutcome":
+    def rejected(cls, info: RejectInfo, *, guarantee: str | None = None) -> "PushResult":
         return cls(
-            OutcomeKind.REJECTED,
-            status_code=info.status_code,
-            error_code=info.error_code,
-            detail=info.detail,
+            PushKind.REJECTED,
+            guarantee=guarantee,
+            reason=info.reason,
             retry_after=info.retry_after,
         )
 
     @classmethod
-    def kafka_unavailable(cls, *, error_code: str, detail: str) -> "IngestOutcome":
-        return cls(
-            OutcomeKind.KAFKA_UNAVAILABLE, error_code=error_code, detail=detail
-        )
+    def unavailable(cls, reason: str, *, guarantee: str | None = None) -> "PushResult":
+        return cls(PushKind.UNAVAILABLE, guarantee=guarantee, reason=reason)
 
 
 # ---- 出口契约：只读消费上下文（位点/commit 不开放）----
@@ -364,7 +366,6 @@ Probe = Callable[[JsonObject], Awaitable[None]]
 """
 
 __all__ = [
-    "AdmissionPolicy",
     "AllowAllSignal",
     "BackfillSource",
     "BackpressureSignal",
@@ -373,15 +374,16 @@ __all__ = [
     "ConsumeContext",
     "Decision",
     "DecisionKind",
+    "DedupCarrier",
     "Envelope",
     "ErrorClassifier",
     "ErrorKind",
-    "IngestOutcome",
     "JsonObject",
     "MessageCodec",
     "NoBackfill",
-    "OutcomeKind",
     "Probe",
     "ProbeResult",
+    "PushKind",
+    "PushResult",
     "RejectInfo",
 ]
