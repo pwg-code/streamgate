@@ -32,7 +32,7 @@ aiokafka gives you **transport**; streamgate gives you the **operating semantics
 
 A complete produce → Kafka → consume → SQLite round trip that runs on a **bare install** (stdlib outlet, zero extra packages) — [`examples/pure_pipeline/`](examples/pure_pipeline/):
 
-> Logging note: streamgate emits via stdlib `logging` and never configures it. Without host configuration only WARNING+ shows (stdlib `lastResort`); add one line `logging.basicConfig(level=logging.INFO, ...)` at your entry point to see INFO logs (the examples all do this — see [Logging](#logging)).
+> Logging note: streamgate emits via stdlib `logging` and never configures it. Without host configuration only WARNING+ shows (stdlib `lastResort`); wire the built-in [`JsonFormatter`](#logging) at your entry point (3 lines, above) to see INFO logs with every structured field rendered as JSON (the examples all do this — see [Logging](#logging)).
 
 ```python
 import asyncio
@@ -198,16 +198,25 @@ There are exactly two sources of truth. **Required settings are true required co
 
 ## Logging
 
-streamgate logs through the standard-library `logging` module — **the library emits records and never configures logging** (no handlers added, no levels changed at import). Every logger lives under the `streamgate` namespace (`streamgate.ingest.producer`, `streamgate.consumer.loop`, ...), so the whole tree is controlled by the host:
+streamgate logs through the standard-library `logging` module — **the library emits records and never configures logging** (no handlers added, no levels changed at import). Every logger lives under the `streamgate` namespace (`streamgate.ingest.producer`, `streamgate.consumer.loop`, ...), so the whole tree is controlled by the host. Event names (`batch_handle_start`, `poison_message_skipped`, ...) are a stable public contract; structured fields travel as flat `LogRecord` extras.
+
+### JSON output: built-in `JsonFormatter`
+
+stdlib's default formatter does **not** render `LogRecord` extras — with `basicConfig(format="%(message)s")` a batch consumer logs just `batch_handle_success`, hiding `batch_size` / `duration_ms`. Use the built-in `JsonFormatter` to make every structured field visible (this is what all examples do):
 
 ```python
 import logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-logging.getLogger("streamgate").setLevel(logging.WARNING)   # or any subtree: silence INFO noise
+from streamgate import JsonFormatter   # equivalently: from streamgate.obs import JsonFormatter
+
+handler = logging.StreamHandler()      # stderr — same destination as 2.x
+handler.setFormatter(JsonFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[handler])
 ```
 
-Unconfigured hosts see WARNING and above only (stdlib `lastResort` on stderr). Event names (`batch_handle_start`, `poison_message_skipped`, ...) are a stable public contract; structured fields travel as flat `LogRecord` extras. For JSON output, attach any stdlib-compatible JSON formatter of your choice.
+Each record renders as one JSON line: `timestamp` (UTC ISO-8601 with `Z` suffix, taken from the `LogRecord` clock), `level`, `logger` (the hierarchical namespace — a 3.0+ extra versus 2.x), `event` (the stable event name; host `%s`-style messages render the same way), then every flat extra field (`batch_size`, `duration_ms`, `partition`, `offset`, ...), plus `error` (formatted traceback) when a record carries `exc_info`. The formatter is a generic component — any logger renders correctly through it: records without extras produce just the base fields, and reserved-attribute collisions are skipped, never raised.
+
+Attach the handler to the root logger as above and host + streamgate logs share one JSON format; attach the same way to `logging.getLogger("streamgate")` instead and only the streamgate tree is formatted. Level control is orthogonal: `logging.getLogger("streamgate").setLevel(logging.WARNING)` silences INFO noise regardless of formatter. Unconfigured hosts still see WARNING+ only (stdlib `lastResort` on stderr).
 
 ## Examples
 

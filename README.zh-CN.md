@@ -372,16 +372,25 @@ pip install "streamgate[http]"     # + HTTP 探活背压
 
 ## 日志
 
-streamgate 走标准库 `logging`——**库只发日志记录、永不配置日志**（import 时不增删任何 handler、不改任何级别）。所有 logger 挂在 `streamgate` 命名空间下（`streamgate.ingest.producer`、`streamgate.consumer.loop` 等），宿主一行整树控制：
+streamgate 走标准库 `logging`——**库只发日志记录、永不配置日志**（import 时不增删任何 handler、不改任何级别）。所有 logger 挂在 `streamgate` 命名空间下（`streamgate.ingest.producer`、`streamgate.consumer.loop` 等），宿主整树控制。事件名（`batch_handle_start`、`poison_message_skipped` 等）是稳定的对外契约；结构化字段以 `LogRecord` extra 平铺。
+
+### JSON 输出：内置 `JsonFormatter`
+
+stdlib 默认 Formatter **不渲染** `LogRecord` extra——用 `basicConfig(format="%(message)s")` 时，批量消费只会打出裸事件名 `batch_handle_success`，看不到 `batch_size` / `duration_ms`。接内置 `JsonFormatter` 即可让全部结构化字段可见（所有示例均如此）：
 
 ```python
 import logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-logging.getLogger("streamgate").setLevel(logging.WARNING)   # 或任意子树：关掉 INFO 噪音
+from streamgate import JsonFormatter   # 等价：from streamgate.obs import JsonFormatter
+
+handler = logging.StreamHandler()      # stderr，与 2.x 输出目标一致
+handler.setFormatter(JsonFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[handler])
 ```
 
-未配置日志的宿主只能看到 WARNING 及以上（stdlib `lastResort` 输出到 stderr）。事件名（`batch_handle_start`、`poison_message_skipped` 等）是稳定的对外契约；结构化字段以 `LogRecord` extra 平铺。需要 JSON 输出时，接任意 stdlib 兼容的 JSON Formatter 即可。
+每条日志渲染为一行 JSON：`timestamp`（UTC ISO8601，`Z` 后缀，取自 LogRecord 时钟）、`level`、`logger`（层级命名空间，2.x 没有的新字段）、`event`（稳定事件名；宿主 `%s` 风格日志同样适用），其余键为全部平铺的结构化字段（`batch_size`、`duration_ms`、`partition`、`offset` 等），记录携带 `exc_info` 时附 `error`（格式化堆栈）。Formatter 是通用组件——任何 logger 经它渲染都正确：无 extra 的记录只输出基础字段，与 LogRecord 保留属性撞键时直接跳过、不抛错。
+
+按上面方式挂 root logger，宿主与 streamgate 日志统一为 JSON 格式；同样三行挂 `logging.getLogger("streamgate")` 则仅 streamgate 树生效。级别控制与 Formatter 正交：`logging.getLogger("streamgate").setLevel(logging.WARNING)` 可关掉 INFO 噪音。未配置日志的宿主仍只能看到 WARNING 及以上（stdlib `lastResort` 输出到 stderr）。
 
 ## 架构
 

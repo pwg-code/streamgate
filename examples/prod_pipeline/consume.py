@@ -19,7 +19,7 @@ from models import Order
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 
-from streamgate import ConsumerOptions
+from streamgate import ConsumerOptions, JsonFormatter
 from streamgate.contrib.mssql_upsert import MssqlConsumer, Upsert
 
 
@@ -38,9 +38,9 @@ async def init_db() -> None:
 
 
 async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
     await init_db()
     consumer = MssqlConsumer(
         db=db_conn(),

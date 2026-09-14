@@ -14,7 +14,7 @@ import os
 
 from models import OrderIn
 
-from streamgate import DedupOptions, Producer, ProducerOptions
+from streamgate import DedupOptions, JsonFormatter, Producer, ProducerOptions
 
 
 def bootstrap_servers() -> str:
@@ -23,9 +23,9 @@ def bootstrap_servers() -> str:
 
 
 async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
     producer = Producer(
         bootstrap_servers(),
         topic=os.environ.get("KAFKA__TOPIC", "orders"),

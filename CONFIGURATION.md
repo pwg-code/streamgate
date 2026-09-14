@@ -29,6 +29,27 @@ streamgate emits logs through the standard-library `logging` module and ships
 `streamgate.*` logger tree; level, handlers and formats are configured by the
 host application (e.g. `logging.getLogger("streamgate")`).
 
+For structured output, attach the built-in `JsonFormatter`
+(`from streamgate import JsonFormatter`, also exported from
+`streamgate.obs`): one JSON line per record with `timestamp` (UTC
+ISO-8601, `Z` suffix) / `level` / `logger` / `event` base fields, every flat
+extra field, and `error` when the record carries `exc_info`:
+
+```python
+import logging
+from streamgate import JsonFormatter
+
+handler = logging.StreamHandler()      # stderr
+handler.setFormatter(JsonFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[handler])
+```
+
+Rendering-side notes: the formatter is generic (any logger's records render
+correctly — records without extras produce just the base fields) and never
+raises on `LogRecord` reserved-attribute collisions (host-side extras are
+skipped; only the library's own `emit()` fails fast on them). The reserved
+attribute set is shared as `streamgate.obs.logging.RESERVED_RECORD_ATTRS`.
+
 ---
 
 ## Consumer (flat arguments)

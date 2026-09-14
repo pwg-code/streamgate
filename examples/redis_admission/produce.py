@@ -15,7 +15,7 @@ import os
 
 from models import OrderIn
 
-from streamgate import DedupOptions, Producer, ProducerOptions
+from streamgate import DedupOptions, JsonFormatter, Producer, ProducerOptions
 from streamgate.contrib.redis_dedup import (
     RedisConfig,
     RedisDedupCache,
@@ -41,9 +41,9 @@ def build_carrier() -> RedisDedupCarrier[OrderIn]:
 
 
 async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
     carrier = build_carrier()
     producer = Producer(
         os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),

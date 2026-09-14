@@ -18,6 +18,7 @@ from streamgate import (
     Consumer,
     ConsumerOptions,
     DlqOptions,
+    JsonFormatter,
     JsonObject,
 )
 
@@ -58,9 +59,9 @@ async def handle_orders(
 
 
 async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
     consumer = Consumer(
         bootstrap_servers=os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),
         topic=os.environ.get("KAFKA__TOPIC", "orders"),

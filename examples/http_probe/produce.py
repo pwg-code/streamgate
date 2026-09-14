@@ -15,7 +15,7 @@ import os
 
 from models import OrderIn
 
-from streamgate import BackpressureConfig, Producer, ProducerOptions
+from streamgate import BackpressureConfig, JsonFormatter, Producer, ProducerOptions
 from streamgate.contrib.http_probe import HttpProbeSignal
 
 
@@ -38,9 +38,9 @@ def backpressure_config() -> BackpressureConfig:
 
 
 async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
     producer = Producer(
         os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),
         topic=os.environ.get("KAFKA__TOPIC", "orders"),

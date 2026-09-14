@@ -52,6 +52,7 @@ from streamgate.ingest.producer import (
     Producer,
     ProducerOptions,
 )
+from streamgate.obs import JsonFormatter
 from streamgate.obs.metrics import LoggingMetricsSink, MetricsSink
 from streamgate.protocols import (
     AllowAllSignal,
@@ -85,7 +86,7 @@ from streamgate.resilience.health import (
 from streamgate.transport.codec import JsonEnvelopeCodec
 from streamgate.transport.kafka import KafkaConsumerService
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 __all__ = [
     "AllowAllSignal",
@@ -115,6 +116,7 @@ __all__ = [
     "InMemoryDedupCarrier",
     "JsonObject",
     "JsonEnvelopeCodec",
+    "JsonFormatter",
     "KafkaConfig",
     "KafkaConsumerService",
     "LoggingMetricsSink",

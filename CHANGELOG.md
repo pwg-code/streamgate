@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-09-14
+
+### Added
+
+- **`JsonFormatter`** — a built-in, out-of-the-box stdlib `logging.Formatter`
+  that renders every record as one JSON line, restoring the structured-field
+  visibility 2.x hosts got for free from loguru's auto-configured JSON sink.
+  3.0.0 kept emitting all structured fields (as flat `LogRecord` extras) but
+  stdlib's default formatter never renders them — a batch consumer logged just
+  the bare `batch_handle_success` event name, hiding `batch_size` /
+  `duration_ms`. Non-breaking; import from `streamgate` or `streamgate.obs`
+  and wire it in three lines:
+
+  ```python
+  import logging
+  from streamgate import JsonFormatter
+
+  handler = logging.StreamHandler()        # stderr, same destination as 2.x
+  handler.setFormatter(JsonFormatter())
+  logging.basicConfig(level=logging.INFO, handlers=[handler])
+  ```
+
+  Output layout per record: `timestamp` (UTC ISO-8601 with `Z` suffix, taken
+  from the `LogRecord` clock, not format time), `level`, `logger` (hierarchical
+  namespace — new versus 2.x), `event` (the stable event-name contract; host
+  `%s`-style messages render identically), then every flat extra field
+  (`batch_size`, `duration_ms`, `partition`, `offset`, ...), plus `error`
+  (formatted traceback) when a record carries `exc_info`. Serialization: one
+  `json.dumps` per record, `ensure_ascii=False`, `default=str` fallback.
+  The formatter is a generic component — any logger's records render correctly
+  through it (no extras ⇒ base fields only), and it never raises on
+  `LogRecord` reserved-attribute collisions (host-side extras are skipped;
+  rendering-side tolerance, the emission-side `emit()` fail-fast is unchanged).
+  Attach the handler to the root logger for unified host + streamgate JSON
+  logs, or to `logging.getLogger("streamgate")` for streamgate-only.
+- `streamgate.obs.logging.RESERVED_RECORD_ATTRS` (also re-exported from
+  `streamgate.obs`) — the reserved-attribute set as a single shared constant,
+  used by `emit()` for fail-fast and by `JsonFormatter` for skip-tolerance
+  (previously privately defined per side).
+- All `examples/` now configure logging through the built-in `JsonFormatter`,
+  so copy-pasting an example yields field-visible JSON logs out of the box
+  (previously `basicConfig(format=...)` rendered no extras).
+
 ## [3.0.0] - 2026-09-14
 
 ### BREAKING — loguru removed, logging switched to stdlib `logging`
