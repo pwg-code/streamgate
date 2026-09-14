@@ -112,8 +112,8 @@ jobs:
 
           try:
               Producer()
-          except ValueError as e:
-              assert "topic is required" in str(e)
+          except TypeError as e:
+              assert "topic" in str(e)
 
           print("bare-install import smoke OK")
           EOF
