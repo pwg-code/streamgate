@@ -16,15 +16,18 @@
 """
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Mapping
 from typing import TypeVar, cast
 
 import redis.asyncio as aioredis
 
-from streamgate import logger
 from streamgate.contrib.redis_dedup.cache import dumps_summary, parse_summary
 from streamgate.contrib.redis_dedup.config import RedisConfig
+from streamgate.obs.logging import emit
 from streamgate.protocols import JsonObject
+
+logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
@@ -85,7 +88,7 @@ class RedisGroupDedupCache:
             socket_connect_timeout=self._config.socket_timeout_ms / 1000,
             decode_responses=True,
         )
-        logger.info("redis_client_created", url=self._config.url)
+        emit(logger, "info", "redis_client_created", url=self._config.url)
 
     async def close(self) -> None:
         if self._client is None:
@@ -93,7 +96,7 @@ class RedisGroupDedupCache:
         if self._injected is None:  # 注入的客户端归调用方关闭
             await self._client.aclose()
         self._client = None
-        logger.info("redis_client_closed")
+        emit(logger, "info", "redis_client_closed")
 
     async def check_health_detail(self) -> tuple[bool, str | None]:
         """健康预检。返回 (是否可用, 错误信息)；可用时 error 为 None。"""
@@ -103,7 +106,7 @@ class RedisGroupDedupCache:
             await asyncio.wait_for(self._client.ping(), timeout=_HEALTH_TIMEOUT_S)
             return True, None
         except Exception as e:
-            logger.debug("redis_health_check_failed", error=str(e))
+            emit(logger, "debug", "redis_health_check_failed", error=str(e))
             return False, str(e)
 
     async def check_health(self) -> bool:

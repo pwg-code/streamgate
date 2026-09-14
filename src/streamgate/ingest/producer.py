@@ -1,8 +1,8 @@
 """Producer：数据生产入口（背压 → 判重 → Kafka 发送 → 发送结果钩子）。
 
-与消费侧 Consumer 完全同构的构造形态：必填项平铺（未传回退环境变量），
-高级项折叠进 options（不传 = 全默认零概念）。三层回退链：
-显式传值 > 环境变量 > 内置默认。
+与消费侧 Consumer 完全同构的构造形态：必填项平铺（真必填参数），
+高级项折叠进 options（不传 = 全默认零概念）。配置只有两个真相来源：
+必填项显式传入，可选项直接持有内置默认值。
 
 路由键与身份键是两个概念：
 - key（构造参数）：路由键 —— 存在理由是顺序。Kafka 同 key 哈希进同分区、
@@ -26,7 +26,7 @@
 
 import asyncio
 import json
-import os
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -39,7 +39,7 @@ from pydantic import BaseModel
 
 from streamgate.config import BackpressureConfig, KafkaConfig
 from streamgate.ingest.dedup.in_memory import InMemoryDedupCarrier
-from streamgate.obs.logging import logger
+from streamgate.obs.logging import emit
 from streamgate.obs.metrics import ProducerMetrics
 from streamgate.protocols import (
     BackpressureSignal,
@@ -58,10 +58,11 @@ from streamgate.resilience.health import (
 )
 from streamgate.transport.codec import JsonEnvelopeCodec
 
+logger = logging.getLogger(__name__)
+
 # schema 锚定推断：泛型参数锚定 Pydantic 模型，lambda 钩子获得精确字段补全。
 RecordT = TypeVar("RecordT", bound=BaseModel)
 
-DEFAULT_BOOTSTRAP_SERVERS = "kafka:9092"
 DEFAULT_MESSAGE_TYPE = "streamgate_record"
 DEFAULT_METRICS_WINDOW_SECONDS = 60
 METRICS_WINDOW_RANGE = (1, 600)
@@ -76,35 +77,8 @@ _MIGRATION_HINT = (
 )
 
 
-def _env_str(key: str) -> str | None:
-    """读取环境变量（去空白；空串视为未设置）。"""
-    value = os.environ.get(key)
-    if value is None or not value.strip():
-        return None
-    return value.strip()
-
-
-def _env_int(key: str, default: int) -> int:
-    """整数环境变量回退（非法值报错并指明变量名）。"""
-    raw = _env_str(key)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        raise ValueError(f"env {key}={raw!r} is not a valid integer") from None
-
-
 def _iso_z(dt: datetime) -> str:
     return dt.isoformat().replace("+00:00", "Z")
-
-
-def _require_topic(topic: str | None) -> str:
-    """必填项解析：显式传值 > 环境变量；仍缺失即报错（含修复指引）。"""
-    resolved = topic or _env_str("KAFKA__TOPIC")
-    if not resolved:
-        raise ValueError("topic is required: pass topic= or set KAFKA__TOPIC")
-    return resolved
 
 
 def _optional_hook(
@@ -160,7 +134,7 @@ class ProducerOptions(Generic[RecordT]):
       None = 手动静态开关（默认不背压）
     - codec：信封编解码（默认内置 JSON 实现）
     - message_type：信封 type 标记
-    - metrics_window_seconds：健康速率窗口；None → METRICS__WINDOW_SECONDS → 60
+    - metrics_window_seconds：健康速率窗口（默认 60，范围 1–600 秒）
     - log_context：日志扩展上下文钩子（进信封日志与 ingest_* 观测事件）
     - kafka：Kafka 连接/自愈调优（KafkaConfig 逃生门）；None = 全默认
     """
@@ -170,27 +144,19 @@ class ProducerOptions(Generic[RecordT]):
     signal: BackpressureSignal | None = None
     codec: MessageCodec | None = None
     message_type: str = DEFAULT_MESSAGE_TYPE
-    metrics_window_seconds: int | None = None
+    metrics_window_seconds: int = DEFAULT_METRICS_WINDOW_SECONDS
     log_context: Callable[[RecordT], JsonObject] | None = None
     kafka: KafkaConfig | None = None
 
     def resolved_metrics_window_seconds(self) -> int:
-        """解析指标窗口（显式传值 > METRICS__WINDOW_SECONDS > 60；越界报错）。"""
-        window = (
-            self.metrics_window_seconds
-            if self.metrics_window_seconds is not None
-            else _env_int(
-                "METRICS__WINDOW_SECONDS", DEFAULT_METRICS_WINDOW_SECONDS
-            )
-        )
+        """指标窗口越界校验（1–600 秒）。"""
         low, high = METRICS_WINDOW_RANGE
-        if not low <= window <= high:
+        if not low <= self.metrics_window_seconds <= high:
             raise ValueError(
-                f"metrics_window_seconds={window} out of range; "
-                f"set a value between {low} and {high} "
-                "(or env METRICS__WINDOW_SECONDS)"
+                f"metrics_window_seconds={self.metrics_window_seconds} "
+                f"out of range; set a value between {low} and {high}"
             )
-        return window
+        return self.metrics_window_seconds
 
 
 class _KafkaClient:
@@ -257,7 +223,7 @@ class _KafkaClient:
                     if isinstance(e, KafkaConnectionError)
                     else "kafka_start_failed"
                 )
-                logger.error(
+                emit(logger, "error", 
                     event,
                     error=str(e),
                     bootstrap_servers=self._config.bootstrap_servers,
@@ -266,13 +232,13 @@ class _KafkaClient:
                 try:
                     await producer.stop()
                 except Exception as close_e:
-                    logger.debug("kafka_cleanup_error", error=str(close_e))
+                    emit(logger, "debug", "kafka_cleanup_error", error=str(close_e))
                 raise
             self._producer = producer
             self._started = True
             self._reconnect_attempt = 0
             self._consecutive_failures = 0
-            logger.info(
+            emit(logger, "info", 
                 "kafka_connected", bootstrap_servers=self._config.bootstrap_servers
             )
 
@@ -289,7 +255,7 @@ class _KafkaClient:
             try:
                 healthy = await self.check_health()
             except Exception as e:
-                logger.debug("health_check_failed", error=str(e))
+                emit(logger, "debug", "health_check_failed", error=str(e))
                 healthy = False
             if healthy:
                 continue
@@ -309,8 +275,8 @@ class _KafkaClient:
             if self._down_started_at is None:
                 now = datetime.now(timezone.utc)
                 self._down_started_at = now
-                logger.info("kafka_down_started", at=now.isoformat())
-        logger.info("kafka_reconnect_started")
+                emit(logger, "info", "kafka_down_started", at=now.isoformat())
+        emit(logger, "info", "kafka_reconnect_started")
         asyncio.create_task(self._reconnect_and_recover())
 
     async def _reconnect(self) -> None:
@@ -334,7 +300,7 @@ class _KafkaClient:
                     self._config.reconnect_base_backoff_seconds
                     * (2 ** min(self._reconnect_attempt - 1, 5)),
                 )
-                logger.error(
+                emit(logger, "error", 
                     "kafka_reconnect_failed",
                     error=str(e),
                     attempt=self._reconnect_attempt,
@@ -348,7 +314,7 @@ class _KafkaClient:
         try:
             await self._reconnect()
         except Exception as e:
-            logger.error("kafka_reconnect_unexpected_error", error=str(e))
+            emit(logger, "error", "kafka_reconnect_unexpected_error", error=str(e))
             return
         finally:
             async with self._lock:
@@ -357,7 +323,7 @@ class _KafkaClient:
         duration = time.monotonic() - started_monotonic
         async with self._lock:
             self._consecutive_failures = 0
-            logger.info(
+            emit(logger, "info", 
                 "kafka_reconnected",
                 reconnect_duration_seconds=round(duration, 2),
                 reconnect_count=self._episode_reconnect_count,
@@ -365,7 +331,7 @@ class _KafkaClient:
             if self._down_started_at is not None:
                 now = datetime.now(timezone.utc)
                 down_duration = (now - self._down_started_at).total_seconds()
-                logger.info(
+                emit(logger, "info", 
                     "kafka_recovered",
                     down_duration_seconds=round(down_duration, 2),
                     reconnect_count=self._episode_reconnect_count,
@@ -383,7 +349,7 @@ class _KafkaClient:
         try:
             await self._producer.stop()
         except Exception as e:
-            logger.debug("kafka_cleanup_error", error=str(e))
+            emit(logger, "debug", "kafka_cleanup_error", error=str(e))
         finally:
             self._producer = None
             self._started = False
@@ -400,7 +366,7 @@ class _KafkaClient:
                 await task
             except asyncio.CancelledError:
                 pass
-        logger.info("kafka_disconnected")
+        emit(logger, "info", "kafka_disconnected")
 
     async def send(self, key: str | None, message: JsonObject) -> None:
         """发送单条消息。key=None 时不带路由键（轮询分区、不保序）。"""
@@ -421,7 +387,7 @@ class _KafkaClient:
             self._last_failure_at = now
             self._rejected_requests += 1
             self._consecutive_failures += 1
-            logger.error(
+            emit(logger, "error", 
                 "kafka_send_failed",
                 key=key,
                 topic=self._topic,
@@ -453,7 +419,7 @@ class _KafkaClient:
                 timeout=2.0,
             )
         except Exception as e:
-            logger.debug("health_check_failed", error=str(e))
+            emit(logger, "debug", "health_check_failed", error=str(e))
             return False
         return bool(ok)
 
@@ -484,8 +450,8 @@ class Producer(Generic[RecordT]):
     """数据生产入口：一个可嵌入宿主的推入门面。
 
     两项必填各回答一个问题：
-    - bootstrap_servers：数据往哪个 Kafka 集群去（未传 → KAFKA__BOOTSTRAP_SERVERS）
-    - topic：写到哪个 topic（未传 → KAFKA__TOPIC；缺失即报错，含修复指引）
+    - bootstrap_servers：数据往哪个 Kafka 集群去（真必填构造参数）
+    - topic：写到哪个 topic（真必填构造参数）
     - key：可选路由键 —— 传则同 key 保序；不传轮询不保序（仅文档承诺）
     - options：高级项折叠（ProducerOptions）；不传 = 全默认零概念
 
@@ -497,8 +463,8 @@ class Producer(Generic[RecordT]):
 
     def __init__(
         self,
-        bootstrap_servers: str | None = None,
-        topic: str | None = None,
+        bootstrap_servers: str,
+        topic: str,
         key: Callable[[RecordT], str] | None = None,
         options: ProducerOptions[RecordT] | None = None,
         **legacy: object,
@@ -508,12 +474,8 @@ class Producer(Generic[RecordT]):
                 f"Producer received unknown legacy parameter(s): "
                 f"{sorted(legacy)}; {_MIGRATION_HINT}"
             )
-        self._bootstrap_servers: str = (
-            bootstrap_servers
-            or _env_str("KAFKA__BOOTSTRAP_SERVERS")
-            or DEFAULT_BOOTSTRAP_SERVERS
-        )
-        self._topic: str = _require_topic(topic)
+        self._bootstrap_servers: str = bootstrap_servers
+        self._topic: str = topic
         self._key = key
         self._options = options or ProducerOptions()
         self._carrier: DedupCarrier[RecordT] | None = self._resolve_carrier()
@@ -567,8 +529,8 @@ class Producer(Generic[RecordT]):
         try:
             await client.start()
         except Exception as e:
-            logger.error("kafka_startup_failed", error=str(e))
-            logger.warning("startup_with_degraded_kafka")
+            emit(logger, "error", "kafka_startup_failed", error=str(e))
+            emit(logger, "warning", "startup_with_degraded_kafka")
         self._client = client
         if self._carrier is not None:
             await _lifecycle_start(self._carrier)
@@ -599,7 +561,7 @@ class Producer(Generic[RecordT]):
             and existence_ttl is not None
             and self._backpressure.trip_seconds >= existence_ttl
         ):
-            logger.warning(
+            emit(logger, "warning", 
                 "backpressure_config_trip_not_less_than_existence_ttl",
                 trip_seconds=self._backpressure.trip_seconds,
                 existence_ttl_seconds=existence_ttl,
@@ -672,7 +634,7 @@ class Producer(Generic[RecordT]):
     ) -> PushResult:
         """背压拒绝（拒绝期零写入：不占位、不写共享存储、不写 Kafka）。"""
         self._metrics.backpressure_rejected.record()
-        logger.warning(
+        emit(logger, "warning", 
             "ingest_rejected_backpressure",
             **log_ctx,
             source=source,
@@ -701,7 +663,7 @@ class Producer(Generic[RecordT]):
         if decision.kind is DecisionKind.DUPLICATE:
             self._metrics.duplicate.record()
             summary = decision.summary or {}
-            logger.info(
+            emit(logger, "info", 
                 "ingest_conflict",
                 **log_ctx,
                 source=source,
@@ -712,7 +674,7 @@ class Producer(Generic[RecordT]):
             info = decision.reject
             assert info is not None
             if info.log_event:
-                logger.warning(
+                emit(logger, "warning", 
                     info.log_event, **log_ctx, source=source, **info.log_fields
                 )
             return PushResult.rejected(info, guarantee=self._guarantee())
@@ -746,7 +708,7 @@ class Producer(Generic[RecordT]):
         if force and self._carrier is not None:
             cache_updated = await self._force_summary_write(record)
 
-        logger.info(
+        emit(logger, "info", 
             "ingest_request",
             **log_ctx,
             received_at=_iso_z(received_at),
@@ -776,7 +738,7 @@ class Producer(Generic[RecordT]):
             await client.send(key=key, message=message)
         except Exception as e:
             self._metrics.produce_failure.record()
-            logger.error(
+            emit(logger, "error", 
                 "kafka_send_failed",
                 **log_ctx,
                 error=str(e),
@@ -802,7 +764,7 @@ class Producer(Generic[RecordT]):
         try:
             await hook(record)
         except Exception as e:
-            logger.warning("dedup_send_success_hook_failed", error=str(e))
+            emit(logger, "warning", "dedup_send_success_hook_failed", error=str(e))
 
     async def _notify_send_failed(self, record: RecordT) -> None:
         """发送失败钩子（best-effort：默认保留占位，实现可释放换取立即重推）。"""
@@ -815,7 +777,7 @@ class Producer(Generic[RecordT]):
         try:
             await hook(record)
         except Exception as e:
-            logger.warning("dedup_send_failed_hook_failed", error=str(e))
+            emit(logger, "warning", "dedup_send_failed_hook_failed", error=str(e))
 
     async def _force_summary_write(self, record: RecordT) -> bool:
         """force 路径摘要写（on_force_accepted）；False = 存储未反映本次记录。"""

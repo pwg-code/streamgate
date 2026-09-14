@@ -14,7 +14,7 @@
               判重、背压、自愈                    批量缓冲、重试、坏数据隔离
 ```
 
-框架核心只装 3 个依赖（`aiokafka` / `loguru` / `pydantic`），核心层**没有一行数据库、Redis、HTTP 客户端代码**。官方 I/O 策略实现收录在 [`streamgate.contrib`](#不想自己写用-contrib)——按 extras 按需安装、装完即可 import；可运行的完整演示在 [`examples/`](examples/)。
+框架核心只装 2 个依赖（`aiokafka` / `pydantic`），核心层**没有一行数据库、Redis、HTTP 客户端代码**。日志走标准库 `logging`——库只发日志记录、永不配置。官方 I/O 策略实现收录在 [`streamgate.contrib`](#不想自己写用-contrib)——按 extras 按需安装、装完即可 import；可运行的完整演示在 [`examples/`](examples/)。
 
 ---
 
@@ -358,7 +358,7 @@ await consumer.run()
 ## 安装
 
 ```bash
-pip install streamgate             # 只装 aiokafka + loguru + pydantic
+pip install streamgate             # 只装 aiokafka + pydantic
 pip install "streamgate[redis]"    # + Redis 分布式判重
 pip install "streamgate[sql]"      # + SQL 幂等出口（SQLite + MSSQL）
 pip install "streamgate[http]"     # + HTTP 探活背压
@@ -368,7 +368,20 @@ pip install "streamgate[http]"     # + HTTP 探活背压
 
 ## 配置
 
-`Producer` / `Consumer` 必填项直接传参，未传时回退同名环境变量（`KAFKA__BOOTSTRAP_SERVERS` / `KAFKA__TOPIC` / `CONSUMER__GROUP_ID`）；高级项收口在 `ProducerOptions` / `ConsumerOptions`（判重、背压、DLQ、调优、指标窗口等），同样跟随 `KAFKA__*` / `CONSUMER__*` 环境变量回退。必填项缺失即启动失败并附修复指引，绝不带猜测默认值上路。数据库/Redis 连接配置归你的应用管（示例各自带本地配置）。详见 [CONFIGURATION.md](CONFIGURATION.md)。
+配置只有两个真相来源：**必填项是真必填构造参数**——`Producer(bootstrap_servers, topic, ...)` 与 `Consumer(bootstrap_servers, topic, group_id, handler)` 缺任一参数即原生 `TypeError`（绝不静默默认、绝不读环境变量）；**可选项直接持有内置默认值**，收口在 `ProducerOptions` / `ConsumerOptions`（判重、背压、DLQ、调优、指标窗口等），不传即文档默认行为。库代码不读取任何环境变量；宿主若要 env 驱动配置，自行解析后显式传参（示例即如此）。数据库/Redis 连接配置归你的应用管（示例各自带本地配置）。详见 [CONFIGURATION.md](CONFIGURATION.md)。
+
+## 日志
+
+streamgate 走标准库 `logging`——**库只发日志记录、永不配置日志**（import 时不增删任何 handler、不改任何级别）。所有 logger 挂在 `streamgate` 命名空间下（`streamgate.ingest.producer`、`streamgate.consumer.loop` 等），宿主一行整树控制：
+
+```python
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logging.getLogger("streamgate").setLevel(logging.WARNING)   # 或任意子树：关掉 INFO 噪音
+```
+
+未配置日志的宿主只能看到 WARNING 及以上（stdlib `lastResort` 输出到 stderr）。事件名（`batch_handle_start`、`poison_message_skipped` 等）是稳定的对外契约；结构化字段以 `LogRecord` extra 平铺。需要 JSON 输出时，接任意 stdlib 兼容的 JSON Formatter 即可。
 
 ## 架构
 
@@ -396,7 +409,7 @@ pip install "streamgate[http]"     # + HTTP 探活背压
 
 ## 从 0.x 迁移
 
-1.0.0 对**两端**都做了破坏性重设计：消费侧 `ConsumerWorker` + `ConsumeSpec` + `RecordWriter` 由扁平 `Consumer` 构造器替代；生产侧 `IngestBinding` + `IngestGateway` 由扁平 `Producer` 构造器替代（`process()` → `push()`、`IngestOutcome` → `PushResult`、`overwrite` → `force`、`admission` → `DedupOptions`、`entity_key`/`slot_key` 拆分为路由键 `key` + 身份键 `DedupOptions.key`）。完整的新旧对照（API、结果 kind、指标名、日志事件、环境变量、import 路径）见 [CHANGELOG](CHANGELOG.md)。
+1.0.0 对**两端**都做了破坏性重设计：消费侧 `ConsumerWorker` + `ConsumeSpec` + `RecordWriter` 由扁平 `Consumer` 构造器替代；生产侧 `IngestBinding` + `IngestGateway` 由扁平 `Producer` 构造器替代（`process()` → `push()`、`IngestOutcome` → `PushResult`、`overwrite` → `force`、`admission` → `DedupOptions`、`entity_key`/`slot_key` 拆分为路由键 `key` + 身份键 `DedupOptions.key`）。3.0.0 移除了内置 loguru 日志（改走标准库 `logging`，`from streamgate import logger` 不复存在），**并移除了全部环境变量回退**：必填项成为真必填构造参数，所有 `KAFKA__*` / `CONSUMER__*` / `METRICS__*` 键不复存在——可选项字段直接持有内置默认值。完整的新旧对照（API、结果 kind、指标名、日志事件、import 路径）与逐项迁移表见 [CHANGELOG](CHANGELOG.md)。
 
 ## 路线图
 

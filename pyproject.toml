@@ -29,12 +29,12 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
     "Typing :: Typed",
 ]
-# 核心依赖绝对最轻（纯机制）：传输（aiokafka）、观测（loguru）、配置（pydantic）。
+# 核心依赖绝对最轻（纯机制）：传输（aiokafka）、配置（pydantic）；
+# 日志为 stdlib logging，零第三方依赖（库只发记录，配置归宿主）。
 # I/O 策略实现收敛于 streamgate.contrib（随 wheel 发布、按 extras 携带依赖）；
 # 核心层不得 import contrib（import-linter 分层契约强制）。
 dependencies = [
     "aiokafka>=0.10",
-    "loguru>=0.7",
     "pydantic>=2.5",
 ]
 

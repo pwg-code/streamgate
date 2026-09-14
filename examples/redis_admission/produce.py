@@ -10,6 +10,7 @@ streamgate.contrib.redis_dedup 正式功能）。
 """
 
 import asyncio
+import logging
 import os
 
 from models import OrderIn
@@ -40,6 +41,9 @@ def build_carrier() -> RedisDedupCarrier[OrderIn]:
 
 
 async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
     carrier = build_carrier()
     producer = Producer(
         os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),

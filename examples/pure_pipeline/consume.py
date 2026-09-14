@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import logging
 import os
 import sqlite3
 from pathlib import Path
@@ -57,6 +58,9 @@ async def handle_orders(
 
 
 async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
     consumer = Consumer(
         bootstrap_servers=os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),
         topic=os.environ.get("KAFKA__TOPIC", "orders"),

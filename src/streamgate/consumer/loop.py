@@ -3,6 +3,7 @@ paused 指数退避自愈、ErrorClassifier 分类 → RETRY/POISON/FATAL 三路
 DLQ 探针定位隔离、停机 flush。"""
 
 import asyncio
+import logging
 import time
 from collections.abc import Callable, Hashable
 from datetime import datetime, timezone
@@ -21,8 +22,8 @@ from streamgate.consumer.dlq import (
     _original_message,
     locate_and_quarantine,
 )
-from streamgate.consumer.options import ResolvedRuntimeTuning
-from streamgate.obs.logging import logger
+from streamgate.consumer.options import RuntimeTuning
+from streamgate.obs.logging import emit
 from streamgate.obs.metrics import DEFAULT_METRICS, ConsumeMetrics, MetricsSink
 from streamgate.protocols import (
     BatchHandler,
@@ -36,6 +37,8 @@ from streamgate.protocols import (
     Probe,
 )
 from streamgate.transport.kafka import KafkaConsumerService, KafkaRecord
+
+logger = logging.getLogger(__name__)
 
 
 def _backlog_level(age_seconds: float, backlog_ttl_seconds: int) -> str:
@@ -58,7 +61,7 @@ class ConsumeRuntime:
         probe: Probe | None,
         batch_size: int,
         flush_timeout_seconds: float,
-        tuning: ResolvedRuntimeTuning,
+        tuning: RuntimeTuning,
         expected_type: str | None,
         collapse_key: Callable[[JsonObject], Hashable] | None,
         log_context: Callable[[JsonObject], JsonObject] | None,
@@ -147,12 +150,12 @@ def _check_backlog_age(runtime: ConsumeRuntime) -> None:
             "pending_count": runtime.pending_count,
             "backlog_ttl_seconds": ttl,
         }
-        logger.info("backlog_age_seconds", **fields)
+        emit(logger, "info", "backlog_age_seconds", **fields)
         level = _backlog_level(age, ttl)
         if level == "error":
-            logger.error("backlog_age_critical", **fields)
+            emit(logger, "error", "backlog_age_critical", **fields)
         elif level == "warning":
-            logger.warning("backlog_age_warn", **fields)
+            emit(logger, "warning", "backlog_age_warn", **fields)
 
 
 def _dedup_by_collapse_key(
@@ -180,7 +183,7 @@ async def _notify_handled(runtime: ConsumeRuntime, batch: list[BufferedMessage])
         try:
             await hook.on_persisted(m.data)
         except Exception as e:
-            logger.warning("on_persisted_failed", error=str(e))
+            emit(logger, "warning", "on_persisted_failed", error=str(e))
 
 
 async def _commit_quietly(runtime: ConsumeRuntime, batch_size: int) -> None:
@@ -190,7 +193,7 @@ async def _commit_quietly(runtime: ConsumeRuntime, batch_size: int) -> None:
     try:
         await consumer.commit()
     except CommitFailedError as e:
-        logger.warning(
+        emit(logger, "warning", 
             "offset_commit_failed_after_handle",
             error=str(e),
             batch_size=batch_size,
@@ -213,7 +216,7 @@ def _note_handle_failure(runtime: ConsumeRuntime, batch_size: int) -> None:
 
 def _abort_fatal(runtime: ConsumeRuntime, exc: Exception) -> None:
     """FATAL 处置：停机告警（消费循环退出，交由进程管理器/人工介入）。"""
-    logger.error("consumer_fatal_error_stopping", error=str(exc))
+    emit(logger, "error", "consumer_fatal_error_stopping", error=str(exc))
     runtime.running = False
 
 
@@ -230,7 +233,7 @@ async def _try_handle_batch(runtime: ConsumeRuntime) -> bool:
     batch_size = len(batch)
     records = [m.data for m in batch]
     context = runtime.context_snapshot()
-    logger.info("batch_handle_start", batch_size=batch_size)
+    emit(logger, "info", "batch_handle_start", batch_size=batch_size)
 
     poison_error: Exception | None = None
     for attempt in range(runtime.tuning.max_retries):
@@ -245,7 +248,7 @@ async def _try_handle_batch(runtime: ConsumeRuntime) -> bool:
             await _notify_handled(runtime, batch)
             await _commit_quietly(runtime, batch_size)  # 再 commit，失败只记日志
             runtime.last_commit_at = datetime.now(timezone.utc)
-            logger.info(
+            emit(logger, "info", 
                 "batch_handle_success",
                 batch_size=batch_size,
                 duration_ms=duration_ms,
@@ -255,7 +258,7 @@ async def _try_handle_batch(runtime: ConsumeRuntime) -> bool:
             _note_handle_failure(runtime, batch_size)
             kind = runtime.error_classifier.classify(e, attempt)
             backoff = runtime.tuning.retry_backoff_base * (2**attempt)
-            logger.error(
+            emit(logger, "error", 
                 "batch_handle_failed",
                 error=str(e),
                 batch_size=batch_size,
@@ -275,7 +278,7 @@ async def _try_handle_batch(runtime: ConsumeRuntime) -> bool:
 
     if poison_error is not None:
         return await _handle_poison_batch(runtime, batch, poison_error)
-    logger.error(
+    emit(logger, "error", 
         "batch_handle_exhausted_retries",
         batch_size=batch_size,
         max_retries=runtime.tuning.max_retries,
@@ -290,7 +293,7 @@ def _log_quarantined(
     log_ctx = (
         runtime.log_context(record.data) if runtime.log_context is not None else {}
     )
-    logger.error(
+    emit(logger, "error", 
         "consumer_record_quarantined",
         **log_ctx,
         partition=request.partition,
@@ -331,7 +334,7 @@ async def _quarantine_whole_batch(
         _log_quarantined(runtime, m, request)
     await _commit_quietly(runtime, len(batch))
     runtime.last_commit_at = datetime.now(timezone.utc)
-    logger.info(
+    emit(logger, "info", 
         "batch_quarantined_without_probe",
         batch_size=len(batch),
         quarantined=len(quarantined),
@@ -353,14 +356,14 @@ async def _handle_poison_batch(
     dlq = runtime.dlq
     if dlq is None:
         return False  # 逃生门 DlqOptions.enabled=false / 未接线：paused 旧行为
-    logger.info(
+    emit(logger, "info", 
         "handle_failure_classified",
         category=ErrorKind.POISON.value,
         error=str(poison_error),
     )
     if runtime.probe is None:
         return await _quarantine_whole_batch(runtime, batch, poison_error)
-    logger.warning(
+    emit(logger, "warning", 
         "batch_bisect_triggered",
         batch_size=len(batch),
         error=str(poison_error),
@@ -399,7 +402,7 @@ async def _finalize_locate_outcome(
         await _notify_handled(runtime, outcome.handled)
     await _commit_quietly(runtime, len(batch))
     runtime.last_commit_at = datetime.now(timezone.utc)
-    logger.info(
+    emit(logger, "info", 
         "batch_handle_success_with_quarantine",
         batch_size=len(batch),
         handled=len(outcome.handled),
@@ -423,7 +426,7 @@ async def _trigger_flush(runtime: ConsumeRuntime) -> bool:
     success = await _try_handle_batch(runtime)
     if not success and runtime.running:
         runtime.paused = True
-        logger.error("consumer_paused_due_to_handle_failures")
+        emit(logger, "error", "consumer_paused_due_to_handle_failures")
     return success
 
 
@@ -431,7 +434,7 @@ async def _paused_recovery_tick(runtime: ConsumeRuntime) -> None:
     """暂停状态下的恢复处理（指数退避，上限 reconnect_max）。"""
     tuning = runtime.tuning
     backoff = tuning.backoff_seconds(runtime.recover_attempt)
-    logger.info(
+    emit(logger, "info", 
         "consumer_paused_retry",
         attempt=runtime.recover_attempt + 1,
         backoff_seconds=backoff,
@@ -440,7 +443,7 @@ async def _paused_recovery_tick(runtime: ConsumeRuntime) -> None:
     if await _try_handle_batch(runtime):
         runtime.paused = False
         runtime.recover_attempt = 0
-        logger.info("consumer_resumed_after_recovery")
+        emit(logger, "info", "consumer_resumed_after_recovery")
     else:
         runtime.recover_attempt += 1
 
@@ -449,7 +452,7 @@ async def _ensure_consumer_ready(runtime: ConsumeRuntime) -> bool:
     """consumer 未启动时重连（指数退避）。返回 False = 本轮跳过后续步骤。"""
     consumer = runtime.consumer
     if consumer is None:
-        logger.error("consumer_not_initialized")
+        emit(logger, "error", "consumer_not_initialized")
         await asyncio.sleep(1.0)
         return False
     if consumer.started:
@@ -462,7 +465,7 @@ async def _ensure_consumer_ready(runtime: ConsumeRuntime) -> bool:
     except Exception as e:
         runtime.reconnect_attempt += 1
         backoff = tuning.backoff_seconds(runtime.reconnect_attempt - 1)
-        logger.error(
+        emit(logger, "error", 
             "kafka_reconnect_failed",
             error=str(e),
             attempt=runtime.reconnect_attempt,
@@ -479,7 +482,7 @@ async def _poll_records(runtime: ConsumeRuntime) -> list[KafkaRecord] | None:
     try:
         return await consumer.poll()
     except Exception as e:
-        logger.error("kafka_poll_error", error=str(e))
+        emit(logger, "error", "kafka_poll_error", error=str(e))
         await asyncio.sleep(1.0)
         return None
 
@@ -497,14 +500,14 @@ async def _quarantine_type_mismatch(
             runtime.quarantined_count += 1
             return
         except DlqSendError:
-            logger.error(
+            emit(logger, "error", 
                 "unknown_type_dlq_failed",
                 partition=record.partition,
                 offset=record.offset,
                 message_type=envelope.type,
             )
             return
-    logger.error(
+    emit(logger, "error", 
         "unknown_type_skipped",
         partition=record.partition,
         offset=record.offset,
@@ -521,7 +524,7 @@ async def _process_record(
     value = record.value
     envelope = runtime.codec.decode(value)
     if envelope is None or value is None:
-        logger.error(
+        emit(logger, "error", 
             "poison_message_skipped",
             partition=record.partition,
             offset=record.offset,
@@ -567,9 +570,9 @@ async def _consume_records(
         assert consumer is not None
         try:
             await consumer.commit(poison_offsets)
-            logger.info("poison_offsets_committed", count=len(poison_offsets))
+            emit(logger, "info", "poison_offsets_committed", count=len(poison_offsets))
         except CommitFailedError as e:
-            logger.warning("poison_offset_commit_failed", error=str(e))
+            emit(logger, "warning", "poison_offset_commit_failed", error=str(e))
 
 
 async def _periodic_backlog_check(runtime: ConsumeRuntime) -> None:
@@ -598,7 +601,7 @@ async def consume_loop(runtime: ConsumeRuntime) -> None:
     # 初始化为当前时间，避免首批消息不足 batch_size 时超时检查因 last_handle_at=None 永不触发
     runtime.last_handle_at = datetime.now(timezone.utc)
 
-    logger.info(
+    emit(logger, "info", 
         "consumer_loop_started",
         group_id=runtime.group_id,
         batch_size=runtime.batch_size,
@@ -632,10 +635,10 @@ async def consume_loop(runtime: ConsumeRuntime) -> None:
 
     # 优雅停机：处理完缓冲区剩余数据
     if runtime.buffer:
-        logger.info("shutdown_flushing_buffer", pending=len(runtime.buffer))
+        emit(logger, "info", "shutdown_flushing_buffer", pending=len(runtime.buffer))
         await _try_handle_batch(runtime)
 
-    logger.info("consumer_loop_stopped")
+    emit(logger, "info", "consumer_loop_stopped")
 
 
 def _build_type_mismatch_request(

@@ -5,6 +5,107 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-09-14
+
+### BREAKING — loguru removed, logging switched to stdlib `logging`
+
+The library no longer depends on loguru. All internal loggers now live under
+the standard-library `streamgate.*` logger tree
+(`streamgate.ingest.producer`, `streamgate.consumer.loop`, ...), and the
+library **only emits records — it never configures logging**: `import
+streamgate` adds no handlers, changes no levels, touches no logging global
+state. Wheel dependencies drop from three to two (`aiokafka`, `pydantic`).
+
+**Log event names and structured field names are unchanged** — only the
+transport moved. What breaks and how to migrate:
+
+| 2.x behavior | 3.0.0 replacement |
+|--------------|-------------------|
+| `from streamgate import logger` | `logging.getLogger("streamgate")` (module-level loggers are `logging.getLogger(__name__)`) |
+| `configure_logger(level=..., fmt=...)` | removed — configure stdlib logging in your app (`logging.basicConfig` / dictConfig) |
+| auto-configured stderr JSON sink on `import streamgate` | gone — unconfigured hosts see WARNING+ only via stdlib `lastResort`; add `logging.basicConfig(level=logging.INFO, ...)` to restore visibility |
+| JSON parsing of the library's stderr output (`{"timestamp", "level", "event", ...extra}`) | attach an equivalent stdlib JSON formatter yourself (recipe below) |
+| per-level control of library logs | `logging.getLogger("streamgate").setLevel(logging.WARNING)` (or any subtree) |
+
+Equivalent JSON formatter recipe (fields `timestamp` / `level` / `event` plus
+flat extras, UTC ISO-8601):
+
+```python
+import json
+import logging
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "timestamp": self.formatTime(record, datefmt="%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "event": record.getMessage(),
+        }
+        reserved = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
+            "asctime", "message", "taskName",
+        }
+        for key, value in record.__dict__.items():
+            if key not in reserved and key not in entry:
+                entry[key] = value
+        return json.dumps(entry, ensure_ascii=False, default=str)
+
+
+handler = logging.StreamHandler()
+handler.setFormatter(JsonFormatter())
+logging.getLogger("streamgate").addHandler(handler)
+logging.getLogger("streamgate").setLevel(logging.INFO)
+```
+
+Notes:
+
+- `streamgate.obs.logging.emit` is the new internal emission helper; passing a
+  structured field whose name collides with a `LogRecord` reserved attribute
+  (`message`, `exc_info`, `asctime`, ...) raises `ValueError` (fail-fast) —
+  rename such fields. The one internal `exc_info=True` site now uses stdlib's
+  native `exc_info` parameter.
+- `LoggingMetricsSink` keeps its level-string dispatch (`debug` / `info` /
+  `warning` / `error`, default `info`) and now writes through stdlib logging.
+
+### BREAKING — environment-variable fallbacks removed
+
+The library no longer reads environment variables. Configuration has exactly
+two sources of truth: **required settings are true required constructor
+arguments** — missing one raises a native Python `TypeError` (missing
+argument), never a silently guessed default such as `kafka:9092` — and
+**optional settings hold their built-in defaults directly** on the options
+objects (`RuntimeTuning` fields are plain `int` / `float` / `str`, not
+`int | None` placeholders). Every `KAFKA__*` / `CONSUMER__*` / `METRICS__*` /
+`BACKPRESSURE__*` key is gone. Hosts that injected configuration via the
+environment (K8s ConfigMap, docker-compose) must resolve it themselves and
+pass the values explicitly after upgrading: a missing required argument now
+fails loudly at construction instead of silently connecting to the wrong
+cluster, and optional knobs fall back to the built-in defaults instead of the
+env value. Migrate key by key:
+
+| Old behavior (≤2.x and earlier in this release) | 3.0.0 |
+|---|---|
+| `Producer(bootstrap_servers=None → KAFKA__BOOTSTRAP_SERVERS → "kafka:9092")` | `Producer(bootstrap_servers, topic, key=None, options=...)` — both truly required, no default |
+| `Consumer(topic=None → KAFKA__TOPIC fail-fast ValueError)` | `Consumer(bootstrap_servers, topic, group_id, handler)` — all truly required; missing ⇒ native `TypeError` |
+| `DlqOptions.enabled=None → CONSUMER__DLQ_ENABLED → True` | `enabled: bool = True` |
+| `DlqOptions.send_retries=None → CONSUMER__DLQ_SEND_RETRIES → 3` | `send_retries: int = 3` |
+| `DlqOptions.topic=None → KAFKA__DLQ_TOPIC` | `topic: str \| None = None` — still required when DLQ is enabled (runtime validation preserved) |
+| `RuntimeTuning` 9 fields `None → CONSUMER__* → default` | fields hold defaults directly (`max_retries=3`, `retry_backoff_base=1.0`, `reconnect_base=1.0`, `reconnect_max=30.0`, `max_poll_records=500`, `session_timeout_ms=30000`, `max_poll_interval_ms=300000`, `auto_offset_reset="earliest"`, `backlog_check_interval=30.0`) |
+| `METRICS__WINDOW_SECONDS` | `metrics_window_seconds=60` passed explicitly on `ProducerOptions` / `ConsumerOptions` |
+| `CONSUMER__BATCH_SIZE` / `CONSUMER__FLUSH_TIMEOUT_SECONDS` | `batch_size` / `flush_timeout` explicit arguments (defaults unchanged: `500` / `5.0`) |
+| `SqliteConsumer(...) / MssqlConsumer(...)` identity arguments optional | `bootstrap_servers` / `topic` / `group_id` are required keyword arguments, mirroring the core `Consumer` |
+| `streamgate.consumer.options.resolve_tuning` / `ResolvedRuntimeTuning` | removed (internal resolution layer); `RuntimeTuning` holds concrete values and its own `backoff_seconds()` |
+
+Notes:
+
+- All runtime validations are preserved (not fallbacks): DLQ topic required
+  when DLQ is enabled, metrics window range 1–600, `batch_size >= 1`,
+  `flush_timeout > 0`.
+- `KafkaConfig` / `BackpressureConfig` field defaults are unchanged — they
+  are pure config objects and never read the environment; the `Producer`
+  constructor values always override `KafkaConfig.bootstrap_servers` /
+  `.topic`.
+
 ## [2.1.0] - 2026-09-11
 
 ### Added

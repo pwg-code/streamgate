@@ -5,12 +5,13 @@
 事件名是公共契约：版本化演进，勿在补丁版本文案内改语义。
 """
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Protocol
 
-from streamgate.obs.logging import logger
+logger = logging.getLogger(__name__)
 
 
 class MetricsSink(Protocol):
@@ -27,7 +28,7 @@ class LoggingMetricsSink:
             "warning": logger.warning,
             "error": logger.error,
         }.get(level, logger.info)
-        fn(name, **fields)
+        fn(name, extra=fields)
 
 
 DEFAULT_METRICS = LoggingMetricsSink()

@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable
 from datetime import datetime, timezone
@@ -12,8 +13,10 @@ from typing import Protocol
 
 from pydantic import BaseModel, Field
 
-from streamgate.obs.logging import logger
+from streamgate.obs.logging import emit
 from streamgate.obs.metrics import ConsumeMetrics, ProducerMetrics
+
+logger = logging.getLogger(__name__)
 
 
 class _ProducerHealthLike(Protocol):
@@ -227,7 +230,7 @@ def _producer_health_response(
     """按探测结果构造快照（字段顺序为公共契约）。"""
     kafka_healthy, kafka_last_failure_at, kafka_reconnect_count, kafka_down_duration_seconds = kafka
     status = _producer_health_status(kafka_healthy, redis_healthy, db_healthy)
-    logger.debug(
+    emit(logger, "debug", 
         "health_check",
         status=status,
         kafka=kafka_healthy,

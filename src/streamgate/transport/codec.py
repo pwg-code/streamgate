@@ -6,9 +6,12 @@
 """
 
 import json
+import logging
 
-from streamgate.obs.logging import logger
+from streamgate.obs.logging import emit
 from streamgate.protocols import Envelope, JsonObject
+
+logger = logging.getLogger(__name__)
 
 ENVELOPE_VERSION = "1"
 
@@ -42,7 +45,7 @@ class JsonEnvelopeCodec:
         try:
             if raw is None:
                 # tombstone（value=None）历史上经 json.loads 抛 TypeError 走毒丸
-                logger.error("poison_message_skipped", error="value is None (tombstone)")
+                emit(logger, "error", "poison_message_skipped", error="value is None (tombstone)")
                 return None
             msg = json.loads(raw)
             if not isinstance(msg, dict):
@@ -58,5 +61,5 @@ class JsonEnvelopeCodec:
                 raw=raw,
             )
         except (json.JSONDecodeError, TypeError) as e:
-            logger.error("poison_message_skipped", error=str(e))
+            emit(logger, "error", "poison_message_skipped", error=str(e))
             return None

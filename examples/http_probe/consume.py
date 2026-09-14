@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import logging
 import os
 
 from health_server import serve_consumer_health
@@ -23,6 +24,9 @@ async def print_orders(
 
 
 async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
     consumer = Consumer(
         bootstrap_servers=os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),
         topic=os.environ.get("KAFKA__TOPIC", "orders"),

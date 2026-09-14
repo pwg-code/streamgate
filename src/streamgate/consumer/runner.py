@@ -8,20 +8,14 @@ Consumer 不是一个独立进程——脚本、FastAPI 服务、独立 worker �
 """
 
 import asyncio
+import logging
 import signal
 from collections.abc import Awaitable, Callable
 
 from streamgate.consumer.dlq import DlqProducer
 from streamgate.consumer.loop import ConsumeRuntime, consume_loop
-from streamgate.consumer.options import (
-    ConsumerOptions,
-    DlqOptions,
-    env_float,
-    env_int,
-    env_str,
-    resolve_tuning,
-)
-from streamgate.obs.logging import logger
+from streamgate.consumer.options import ConsumerOptions, DlqOptions
+from streamgate.obs.logging import emit
 from streamgate.obs.metrics import ConsumeMetrics
 from streamgate.protocols import BatchHandler
 from streamgate.resilience.health import (
@@ -31,9 +25,10 @@ from streamgate.resilience.health import (
 from streamgate.transport.codec import JsonEnvelopeCodec
 from streamgate.transport.kafka import KafkaConsumerService
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_BATCH_SIZE = 500
 DEFAULT_FLUSH_TIMEOUT_SECONDS = 5.0
-DEFAULT_BOOTSTRAP_SERVERS = "kafka:9092"
 
 # 旧参数 → 迁移指引（收到即报错，指向 CHANGELOG 迁移指南）
 _MIGRATION_HINT = (
@@ -57,44 +52,34 @@ async def _lifecycle_close(component: object) -> None:
         await close()
 
 
-def _require_identity(
-    explicit: str | None, env_key: str, arg_name: str
-) -> str:
-    """必填项解析：显式传值 > 环境变量；仍缺失即报错（含修复指引）。"""
-    resolved = explicit or env_str(env_key)
-    if not resolved:
-        raise ValueError(f"{arg_name} is required: pass {arg_name}= or set {env_key}")
-    return resolved
-
-
 class Consumer:
     """数据出口：一个可嵌入宿主的消费循环。
 
     从 Kafka 读出消息，交给使用方给的处理函数；位点、重试、自愈、
     毒批隔离、优雅停机全是框架机制。四个必填项各回答一个问题：
 
-    - bootstrap_servers：数据从哪个 Kafka 集群来（未传 → KAFKA__BOOTSTRAP_SERVERS）
-    - topic：从哪个 topic 读（未传 → KAFKA__TOPIC）
-    - group_id：消费组身份（位点归属；未传 → CONSUMER__GROUP_ID）
+    - bootstrap_servers：数据从哪个 Kafka 集群来（真必填构造参数）
+    - topic：从哪个 topic 读（真必填构造参数）
+    - group_id：消费组身份（位点归属；真必填构造参数）
     - handler：数据到哪去——唯一出口契约 ``handler(batch, context)``：
       正常返回 = 整批处理成功（框架提交位点）；抛异常 = 按 ErrorClassifier
       分类处置（RETRY 退避重试 / POISON 定位隔离 / FATAL 停机）。
       实现须幂等。使用方对象实现 start()/close() 时生命周期由框架托管。
 
     batch_size=1 即单条实时；batch_size=N + flush_timeout 即攒批
-    （未传 → CONSUMER__BATCH_SIZE / CONSUMER__FLUSH_TIMEOUT_SECONDS）。
+    （不传 = 内置默认值：500 条 / 5.0 秒）。
     高级项（expected_type / probe / classifier / persist_hook / dlq /
     tuning 等）收口在 ``options=ConsumerOptions(...)``，不传即全默认。
     """
 
     def __init__(
         self,
-        bootstrap_servers: str | None = None,
-        topic: str | None = None,
-        group_id: str | None = None,
-        handler: BatchHandler | None = None,
-        batch_size: int | None = None,
-        flush_timeout: float | None = None,
+        bootstrap_servers: str,
+        topic: str,
+        group_id: str,
+        handler: BatchHandler,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        flush_timeout: float = DEFAULT_FLUSH_TIMEOUT_SECONDS,
         options: ConsumerOptions | None = None,
         **legacy: object,
     ) -> None:
@@ -103,39 +88,16 @@ class Consumer:
                 f"Consumer received unknown legacy parameter(s): "
                 f"{sorted(legacy)}; {_MIGRATION_HINT}"
             )
-        if handler is None:
-            raise TypeError(
-                "handler is required: pass an async callable "
-                "handler(batch, context); only code injection is supported"
-            )
-        self._bootstrap_servers: str = (
-            bootstrap_servers
-            or env_str("KAFKA__BOOTSTRAP_SERVERS")
-            or DEFAULT_BOOTSTRAP_SERVERS
-        )
-        self._topic: str = _require_identity(topic, "KAFKA__TOPIC", "topic")
-        self._group_id: str = _require_identity(
-            group_id, "CONSUMER__GROUP_ID", "group_id"
-        )
+        self._bootstrap_servers: str = bootstrap_servers
+        self._topic: str = topic
+        self._group_id: str = group_id
         self._handler = handler
-        self._batch_size: int = (
-            batch_size
-            if batch_size is not None
-            else env_int("CONSUMER__BATCH_SIZE", DEFAULT_BATCH_SIZE)
-        )
-        if self._batch_size < 1:
-            raise ValueError(f"batch_size must be >= 1, got {self._batch_size}")
-        self._flush_timeout: float = (
-            flush_timeout
-            if flush_timeout is not None
-            else env_float(
-                "CONSUMER__FLUSH_TIMEOUT_SECONDS", DEFAULT_FLUSH_TIMEOUT_SECONDS
-            )
-        )
-        if self._flush_timeout <= 0:
-            raise ValueError(
-                f"flush_timeout must be > 0, got {self._flush_timeout}"
-            )
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        self._batch_size: int = batch_size
+        if flush_timeout <= 0:
+            raise ValueError(f"flush_timeout must be > 0, got {flush_timeout}")
+        self._flush_timeout: float = flush_timeout
         self._options = options or ConsumerOptions()
         self.runtime: ConsumeRuntime | None = None
         self._stop_event: asyncio.Event | None = None
@@ -144,12 +106,12 @@ class Consumer:
 
     def _build_dlq(self, dlq_options: DlqOptions) -> DlqProducer | None:
         """DLQ 隔离 producer（启动失败仅记日志，懒启动在 quarantine 兜底）。"""
-        if not dlq_options.resolved_enabled():
+        if not dlq_options.enabled:
             return None
         return DlqProducer(
             self._bootstrap_servers,
-            topic=dlq_options.resolved_topic(),
-            send_retries=dlq_options.resolved_send_retries(),
+            topic=dlq_options.topic,
+            send_retries=dlq_options.send_retries,
             message_type=dlq_options.message_type,
         )
 
@@ -169,7 +131,7 @@ class Consumer:
         await _lifecycle_start(self._handler)
 
         # 初始化 Kafka consumer（启动失败不 crash，交给消费循环重连）
-        tuning = resolve_tuning(options.tuning)
+        tuning = options.tuning
         consumer = KafkaConsumerService(
             self._bootstrap_servers,
             self._topic,
@@ -182,7 +144,7 @@ class Consumer:
         try:
             await consumer.start()
         except Exception as e:
-            logger.error(
+            emit(logger, "error", 
                 "consumer_startup_failed_degraded",
                 error=str(e),
                 bootstrap_servers=self._bootstrap_servers,
@@ -231,7 +193,7 @@ class Consumer:
         """注册停机信号处理（优雅停机）。"""
 
         def _signal_handler() -> None:
-            logger.info("shutdown_signal_received")
+            emit(logger, "info", "shutdown_signal_received")
             runtime.running = False
             stop_event.set()
 
@@ -266,10 +228,10 @@ class Consumer:
         try:
             await asyncio.wait_for(consume_task, timeout=30.0)
         except asyncio.TimeoutError:
-            logger.warning("shutdown_timeout_consume_loop_did_not_finish")
+            emit(logger, "warning", "shutdown_timeout_consume_loop_did_not_finish")
 
         await self.shutdown()
-        logger.info("app_stopped")
+        emit(logger, "info", "app_stopped")
 
     async def shutdown(self) -> None:
         """关闭资源（幂等）。"""

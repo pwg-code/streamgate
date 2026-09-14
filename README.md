@@ -9,7 +9,7 @@ English | [中文](README.zh-CN.md)
 
 **streamgate** is a pure-core Kafka data pipeline framework: a dedup-aware door on the way in, reliable delivery through Kafka, and one obvious outlet on the other side — `Producer(bootstrap_servers, topic, ...)` / `Consumer(bootstrap_servers, topic, group_id, handler)`.
 
-The wheel installs exactly three dependencies (`aiokafka`, `loguru`, `pydantic`) and the core contains **zero database, Redis or HTTP-client code**. Official I/O strategy implementations live in [`streamgate.contrib`](#contrib-official-strategy-implementations) — opt-in via extras — and runnable demos live in [`examples/`](examples/).
+The wheel installs exactly two dependencies (`aiokafka`, `pydantic`) and the core contains **zero database, Redis or HTTP-client code**. Logging goes through the standard-library `logging` module — the library emits records and never configures them. Official I/O strategy implementations live in [`streamgate.contrib`](#contrib-official-strategy-implementations) — opt-in via extras — and runnable demos live in [`examples/`](examples/).
 
 - 中文提示：本仓库对外文档以英文为主；内部代码注释保留中文。
 
@@ -31,6 +31,8 @@ aiokafka gives you **transport**; streamgate gives you the **operating semantics
 ## Quick Start
 
 A complete produce → Kafka → consume → SQLite round trip that runs on a **bare install** (stdlib outlet, zero extra packages) — [`examples/pure_pipeline/`](examples/pure_pipeline/):
+
+> Logging note: streamgate emits via stdlib `logging` and never configures it. Without host configuration only WARNING+ shows (stdlib `lastResort`); add one line `logging.basicConfig(level=logging.INFO, ...)` at your entry point to see INFO logs (the examples all do this — see [Logging](#logging)).
 
 ```python
 import asyncio
@@ -182,7 +184,7 @@ await consumer.run()
 ## Installation
 
 ```bash
-pip install streamgate             # aiokafka + loguru + pydantic. That's it.
+pip install streamgate             # aiokafka + pydantic. That's it.
 pip install "streamgate[redis]"    # + Redis distributed dedup carrier
 pip install "streamgate[sql]"      # + SQL upsert outlet (SQLite + MSSQL)
 pip install "streamgate[http]"     # + HTTP probe backpressure
@@ -192,7 +194,20 @@ For anything else (PostgreSQL, Elasticsearch, your own destination...), write th
 
 ## Configuration
 
-Both sides take required settings as flat constructor arguments with environment-variable fallbacks (`KAFKA__BOOTSTRAP_SERVERS`, `KAFKA__TOPIC`, `CONSUMER__GROUP_ID`); advanced knobs fold into `ProducerOptions` / `ConsumerOptions` (dedup, backpressure, DLQ, tuning, metrics window) with the same env fallbacks. Required settings fail fast at startup with fix instructions. Database/Redis connection settings belong to your application (see the examples' local configs). See [CONFIGURATION.md](CONFIGURATION.md).
+There are exactly two sources of truth. **Required settings are true required constructor parameters** — `Producer(bootstrap_servers, topic, ...)` and `Consumer(bootstrap_servers, topic, group_id, handler)` fail with a native `TypeError` the moment an argument is missing (they are never silently defaulted or read from the environment). **Optional settings directly hold their built-in defaults** and fold into `ProducerOptions` / `ConsumerOptions` (dedup, backpressure, DLQ, tuning, metrics window) — omit them and the documented defaults apply. The library reads no environment variables; if your host wants env-driven config, resolve it yourself and pass the values explicitly (the examples do exactly that). Database/Redis connection settings belong to your application (see the examples' local configs). See [CONFIGURATION.md](CONFIGURATION.md).
+
+## Logging
+
+streamgate logs through the standard-library `logging` module — **the library emits records and never configures logging** (no handlers added, no levels changed at import). Every logger lives under the `streamgate` namespace (`streamgate.ingest.producer`, `streamgate.consumer.loop`, ...), so the whole tree is controlled by the host:
+
+```python
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logging.getLogger("streamgate").setLevel(logging.WARNING)   # or any subtree: silence INFO noise
+```
+
+Unconfigured hosts see WARNING and above only (stdlib `lastResort` on stderr). Event names (`batch_handle_start`, `poison_message_skipped`, ...) are a stable public contract; structured fields travel as flat `LogRecord` extras. For JSON output, attach any stdlib-compatible JSON formatter of your choice.
 
 ## Examples
 
@@ -200,7 +215,7 @@ See [`examples/`](examples/) for five runnable pipelines plus a `docker-compose.
 
 ## Migrating from 0.x
 
-1.0.0 redesigned **both** sides (breaking): the consumer side replaces `ConsumerWorker` + `ConsumeSpec` + `RecordWriter` with the flat `Consumer` constructor; the producer side replaces `IngestBinding` + `IngestGateway` with the flat `Producer` constructor (`process()` → `push()`, `IngestOutcome` → `PushResult`, `overwrite` → `force`, `admission` → `DedupOptions`, `entity_key`/`slot_key` split into routing `key` + identity `DedupOptions.key`). See the [CHANGELOG](CHANGELOG.md) for the complete old→new mapping (API, result kinds, metrics names, log events, env keys, import paths).
+1.0.0 redesigned **both** sides (breaking): the consumer side replaces `ConsumerWorker` + `ConsumeSpec` + `RecordWriter` with the flat `Consumer` constructor; the producer side replaces `IngestBinding` + `IngestGateway` with the flat `Producer` constructor (`process()` → `push()`, `IngestOutcome` → `PushResult`, `overwrite` → `force`, `admission` → `DedupOptions`, `entity_key`/`slot_key` split into routing `key` + identity `DedupOptions.key`). 3.0.0 removed the bundled loguru logging (stdlib `logging` instead — `from streamgate import logger` is gone) **and all environment-variable fallbacks**: required settings are now true required constructor parameters and every `KAFKA__*` / `CONSUMER__*` / `METRICS__*` key is gone — options hold their built-in defaults directly. See the [CHANGELOG](CHANGELOG.md) for the complete old→new mapping (API, result kinds, metrics names, log events, import paths) and the per-key migration table.
 
 ## Roadmap
 

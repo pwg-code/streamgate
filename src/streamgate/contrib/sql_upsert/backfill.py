@@ -8,13 +8,16 @@
 """
 
 import asyncio
+import logging
 from datetime import datetime
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from streamgate import logger
+from streamgate.obs.logging import emit
 from streamgate.protocols import JsonObject
+
+logger = logging.getLogger(__name__)
 
 
 def _jsonable(value: object) -> object:
@@ -84,7 +87,7 @@ class SqlBackfill:
             f"SELECT {', '.join(select_cols)} "
             f"FROM {table} WHERE {where_col} = :k"
         )
-        logger.info(
+        emit(logger, "info", 
             f"{component_label}_initialized",
             engine="sqlite" if "sqlite" in str(getattr(engine, "url", "")).lower() else "mssql",
             scope="group" if group_column is not None else "identity",
@@ -95,7 +98,7 @@ class SqlBackfill:
             return
         await self._engine.dispose()
         self._engine = None
-        logger.info(f"{self._label}_closed")
+        emit(logger, "info", f"{self._label}_closed")
 
     async def check_health(self) -> bool:
         ok, _ = await self.check_health_detail()
@@ -110,7 +113,7 @@ class SqlBackfill:
                 await conn.execute(text("SELECT 1"))
             return True, None
         except Exception as e:
-            logger.debug(f"{self._label}_health_failed", error=str(e))
+            emit(logger, "debug", f"{self._label}_health_failed", error=str(e))
             return False, str(e)
 
     async def load(self, scope: str) -> dict[str, JsonObject] | None:
@@ -126,7 +129,7 @@ class SqlBackfill:
                 self._fetch_rows(scope), timeout=self._query_wait_seconds
             )
         except asyncio.TimeoutError:
-            logger.error(
+            emit(logger, "error", 
                 f"{self._label}_load_timeout",
                 scope=scope,
                 wait_seconds=self._query_wait_seconds,

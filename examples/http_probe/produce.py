@@ -10,6 +10,7 @@ BACKPRESSURE__TRIP_SECONDS 制造积压拒绝；恢复 consume.py 后磁滞放�
 """
 
 import asyncio
+import logging
 import os
 
 from models import OrderIn
@@ -37,6 +38,9 @@ def backpressure_config() -> BackpressureConfig:
 
 
 async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
     producer = Producer(
         os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),
         topic=os.environ.get("KAFKA__TOPIC", "orders"),

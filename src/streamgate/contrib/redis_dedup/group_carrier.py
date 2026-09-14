@@ -16,6 +16,7 @@ force 路径）；消费侧 write 成功 → on_persisted（判重与消费侧�
 """
 
 import asyncio
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -24,10 +25,10 @@ from typing import Generic, TypeVar
 from pydantic import BaseModel
 from redis.exceptions import RedisError
 
-from streamgate import logger
 from streamgate.contrib.redis_dedup.carrier import RejectReason
 from streamgate.contrib.redis_dedup.config import RedisConfig
 from streamgate.contrib.redis_dedup.group_cache import RedisGroupDedupCache
+from streamgate.obs.logging import emit
 from streamgate.protocols import (
     BackfillSource,
     Decision,
@@ -36,6 +37,8 @@ from streamgate.protocols import (
     NoBackfill,
     RejectInfo,
 )
+
+logger = logging.getLogger(__name__)
 
 _REDIS_ERRORS: tuple[type[Exception], ...] = (
     RedisError,
@@ -189,7 +192,7 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
             if self._config.fail_closed_on_unavailable:
                 redis_ok, redis_error = await self._cache.check_health_detail()
                 if not redis_ok:
-                    logger.warning(
+                    emit(logger, "warning", 
                         "force_rejected_redis_unavailable",
                         **self._context(group, identity),
                         error=redis_error,
@@ -226,7 +229,7 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
                 return True
             except _REDIS_ERRORS as e:
                 if attempt == 2:
-                    logger.error(
+                    emit(logger, "error", 
                         "force_summary_write_failed",
                         **self._context(group, identity),
                         error=str(e),
@@ -242,7 +245,7 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
         try:
             await self._cache.write_summary(group, identity, self._summarize(record))
         except Exception as e:
-            logger.warning(
+            emit(logger, "warning", 
                 "cache_refresh_failed",
                 **self._context(group, identity),
                 error=str(e),
@@ -273,7 +276,7 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
             return await self._direct_backfill_check(group, identity, e)
         if exists:
             # field 缺失 = DB 内确认无此身份 → 原子占位
-            logger.info("group_cache_shortcut", **self._context(group, identity))
+            emit(logger, "info", "group_cache_shortcut", **self._context(group, identity))
             return await self._reserve(group, identity, meta)
 
         # ---- 阶段 3：全新组冷回源（组级单飞 + 并发闸门）----
@@ -289,10 +292,10 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
     ) -> Decision | None:
         """阶段3终结：按单飞回源结果完成回填/占位/拒绝。"""
         if outcome.gate_full:
-            logger.warning("cold_path_gate_rejected", **self._context(group, identity))
+            emit(logger, "warning", "cold_path_gate_rejected", **self._context(group, identity))
             return self._reject_gate_full()
         if outcome.result is GroupLoadResult.FAILED:
-            logger.error(
+            emit(logger, "error", 
                 "load_group_failed",
                 **self._context(group, identity),
                 error=outcome.error,
@@ -318,7 +321,7 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
         """
         pending = self._in_flight.get(group)
         if pending is not None:
-            logger.info("cold_group_load_hit", **self._context(group, ""))
+            emit(logger, "info", "cold_group_load_hit", **self._context(group, ""))
             return await asyncio.shield(pending)
 
         loop = asyncio.get_running_loop()
@@ -339,7 +342,7 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
         try:
             outcome = await self._gated_load_group(group)
         except Exception as e:  # 兜底（正常路径不抛，只保 waiting 不悬挂）
-            logger.error("load_group_failed", **self._context(group, ""), error=str(e))
+            emit(logger, "error", "load_group_failed", **self._context(group, ""), error=str(e))
             outcome = GroupLoadOutcome(GroupLoadResult.FAILED, error=str(e))
         if not future.done():
             future.set_result(outcome)
@@ -347,12 +350,12 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
     async def _gated_load_group(self, group: str) -> GroupLoadOutcome:
         """整组回源：并发闸门。闸门满返回 GATE_FULL 态（REJECT 方向）。"""
         if self._cold_gate is None:
-            logger.info("cold_group_load", **self._context(group, ""))
+            emit(logger, "info", "cold_group_load", **self._context(group, ""))
             return await self._load_group(group)
         if self._cold_gate.locked():
             return GroupLoadOutcome(GroupLoadResult.FAILED, gate_full=True)
         async with self._cold_gate:
-            logger.info("cold_group_load", **self._context(group, ""))
+            emit(logger, "info", "cold_group_load", **self._context(group, ""))
             return await self._load_group(group)
 
     async def _load_group(self, group: str) -> GroupLoadOutcome:
@@ -404,7 +407,7 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
             if self._config.fail_closed_on_unavailable:
                 return self._reject_redis_unavailable(error=str(e))
             # 占位失败 -> 无占位继续（ERROR 告警，删 group key 修复）；仅配置关闭时可达
-            logger.error(
+            emit(logger, "error", 
                 "reserve_failed_degraded",
                 **self._context(group, identity),
                 error=str(e),
@@ -422,7 +425,7 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
         try:
             await self._cache.write_group_fields(group, mapping)
         except _REDIS_ERRORS as e:
-            logger.warning(
+            emit(logger, "warning", 
                 "group_backfill_fields_failed",
                 **self._context(group, ""),
                 error=str(e),
@@ -432,17 +435,17 @@ class RedisGroupDedupCarrier(Generic[RecordModelT]):
         self, group: str, identity: str, error: Exception
     ) -> Decision | None:
         """Redis 故障降级：直查回源库，不回填、不占位。"""
-        logger.warning(
+        emit(logger, "warning", 
             "redis_degraded_direct_backfill",
             **self._context(group, identity),
             error=str(error),
         )
         outcome = await self._gated_load_group(group)
         if outcome.gate_full:
-            logger.warning("cold_path_gate_rejected", **self._context(group, identity))
+            emit(logger, "warning", "cold_path_gate_rejected", **self._context(group, identity))
             return self._reject_gate_full()
         if outcome.result is GroupLoadResult.FAILED:
-            logger.error(
+            emit(logger, "error", 
                 "load_group_failed_degraded",
                 **self._context(group, identity),
                 error=outcome.error,

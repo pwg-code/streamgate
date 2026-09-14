@@ -7,6 +7,7 @@ mssql MERGE），单事务批量处理。
 """
 
 import asyncio
+import logging
 from collections.abc import Callable
 
 from sqlalchemy import inspect as sa_inspect
@@ -14,7 +15,6 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlmodel import SQLModel
 
-from streamgate import logger
 from streamgate.contrib.sql_upsert._dialects import mssql as mssql_dialect
 from streamgate.contrib.sql_upsert._dialects import sqlite as sqlite_dialect
 from streamgate.contrib.sql_upsert._dialects.mssql import mssql_cast_types
@@ -23,7 +23,10 @@ from streamgate.contrib.sql_upsert.engines import (
     async_session_factory,
     create_write_engine,
 )
+from streamgate.obs.logging import emit
 from streamgate.protocols import BatchHandler, ConsumeContext, JsonObject, Probe
+
+logger = logging.getLogger(__name__)
 
 # 行级变换钩子类型（Upsert.prepare 参数）
 RowTransform = Callable[[JsonObject], JsonObject]
@@ -183,15 +186,15 @@ class _UpsertOutlet:
                     await conn.execute(text("PRAGMA busy_timeout=5000"))
                     await conn.execute(text("PRAGMA foreign_keys=ON"))
                     await conn.run_sync(_create_tables)
-                logger.info("db_initialized", engine=engine_name, url=url)
+                emit(logger, "info", "db_initialized", engine=engine_name, url=url)
             # 统一启动期探测（mssql 分支建连校验；sqlite 建表即已连，再探一次成本可忽略）
             ok, err = await self.check_health_detail()
             if ok:
-                logger.info("db_connected", engine=engine_name, url=url)
+                emit(logger, "info", "db_connected", engine=engine_name, url=url)
             else:
-                logger.error("db_connection_failed", engine=engine_name, url=url, error=err)
+                emit(logger, "error", "db_connection_failed", engine=engine_name, url=url, error=err)
         except Exception as e:
-            logger.error("db_connection_failed", engine=engine_name, url=url, error=str(e))
+            emit(logger, "error", "db_connection_failed", engine=engine_name, url=url, error=str(e))
 
     async def close(self) -> None:
         if self._engine is None:
@@ -199,7 +202,7 @@ class _UpsertOutlet:
         await self._engine.dispose()
         self._engine = None
         self._session_factory = None
-        logger.info("db_disconnected")
+        emit(logger, "info", "db_disconnected")
 
     async def check_health(self) -> bool:
         ok, _ = await self.check_health_detail()
@@ -218,7 +221,7 @@ class _UpsertOutlet:
             await asyncio.wait_for(_ping(), timeout=2.0)
             return True, None
         except Exception as e:
-            logger.debug("db_health_check_failed", error=str(e))
+            emit(logger, "debug", "db_health_check_failed", error=str(e))
             return False, str(e)
 
     async def __call__(
@@ -226,7 +229,7 @@ class _UpsertOutlet:
     ) -> None:
         """BatchHandler 契约：整批单事务 upsert；失败以异常表达（框架分类处置）。"""
         counts = await self.write_batch(batch)
-        logger.debug(
+        emit(logger, "debug", 
             "db_upsert_completed",
             **{f"{name}_count": count for name, count in counts.items()},
         )
@@ -251,7 +254,7 @@ class _UpsertOutlet:
                 timeout=self._config.write_wait_seconds,
             )
         except asyncio.TimeoutError:
-            logger.error(
+            emit(logger, "error", 
                 "upsert_batch_timeout",
                 batch_size=len(batch),
                 wait_seconds=self._config.write_wait_seconds,

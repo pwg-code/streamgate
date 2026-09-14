@@ -1,43 +1,37 @@
-import json
-import sys
-from datetime import timezone
+"""stdlib logging 发射层：库只发日志记录、永不配置（配置权归宿主）。
 
-from loguru import logger as _logger
-from loguru._handler import Message
+各模块经 ``logging.getLogger(__name__)`` 取得层级命名空间 logger
+（如 ``streamgate.ingest.producer``），宿主用
+``logging.getLogger("streamgate")`` 即可整树控制级别与 handler。
+``emit`` 是内部发射辅助：保持调用点单行形态，并统一防御
+（结构化字段名与 LogRecord 保留属性冲突时 fail-fast）。
+本模块不触碰任何 logging 全局状态（无 handler 增删、无级别修改）。
+"""
 
+import logging
+from typing import Final
 
-def _json_sink(message: Message) -> None:
-    record = message.record
-    log_entry: dict[str, object] = {
-        "timestamp": record["time"].astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "level": record["level"].name,
-        "event": record["message"],
-    }
-    extra = record["extra"]
-    for key, value in extra.items():
-        if key not in log_entry:
-            log_entry[key] = value
-    sys.stderr.write(json.dumps(log_entry, ensure_ascii=False, default=str) + "\n")
+_LEVELS: Final[dict[str, int]] = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+}
 
-
-def _text_sink(message: Message) -> None:
-    record = message.record
-    extra_str = " ".join(f"{k}={v}" for k, v in record["extra"].items())
-    sys.stderr.write(
-        f"{record['time'].astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')} "
-        f"{record['level'].name} "
-        f"{record['message']} "
-        f"{extra_str}\n"
-    )
+# LogRecord 实例属性 + 格式化期追加属性（asctime/message/exc_text）：
+# extra 携带这些键会在 stdlib 内部炸 KeyError，这里提前 fail-fast 并给出可读错误
+_RESERVED: Final[frozenset[str]] = frozenset(
+    logging.LogRecord("", 0, "", 0, "", (), None).__dict__
+) | {"asctime", "exc_text", "message", "taskName"}
 
 
-def configure_logger(level: str = "INFO", fmt: str = "json") -> None:
-    _logger.remove()
-    sink = _json_sink if fmt == "json" else _text_sink
-    # loguru 0.7 类型桩未覆盖 callable sink（运行时支持），按桩缺陷最小抑制
-    _logger.add(sink, level=level)  # type: ignore[reportCallIssue]
-
-
-logger = _logger
-
-configure_logger()
+def emit(logger: logging.Logger, level: str, event: str, /, **fields: object) -> None:
+    """发射一条结构化日志记录：event 为事件名（对外契约，勿改语义），fields 平铺进 extra。"""
+    conflicts = fields.keys() & _RESERVED
+    if conflicts:
+        names = ", ".join(sorted(conflicts))
+        raise ValueError(
+            f"log field conflicts with LogRecord reserved attribute(s): {names}; "
+            "rename the field, e.g. add a 'sg_' prefix"
+        )
+    logger.log(_LEVELS[level], event, extra=fields)

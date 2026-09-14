@@ -10,6 +10,7 @@ consume.py 停掉后再运行：探活不可达 → fail-closed 背压拒绝。
 """
 
 import asyncio
+import logging
 import os
 
 from models import OrderIn
@@ -58,6 +59,9 @@ def backpressure_config() -> BackpressureConfig:
 
 
 async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
     producer = Producer(
         os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:9092"),
         topic=os.environ.get("KAFKA__TOPIC", "orders"),

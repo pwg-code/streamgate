@@ -11,6 +11,10 @@ SqliteConsumer 预接三件套（批量 upsert handler + 单条探针 + 方言�
 """
 
 from streamgate import Consumer, ConsumerOptions
+from streamgate.consumer.runner import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_FLUSH_TIMEOUT_SECONDS,
+)
 from streamgate.contrib._deps import require_extra_import
 from streamgate.contrib.sql_upsert.factory import resolve_db, sql_upsert_consumer
 
@@ -33,18 +37,19 @@ def SqliteConsumer(
     db: str | DbConfig,
     upserts: list[Upsert],
     *,
-    bootstrap_servers: str | None = None,
-    topic: str | None = None,
-    group_id: str | None = None,
-    batch_size: int | None = None,
-    flush_timeout: float | None = None,
+    bootstrap_servers: str,
+    topic: str,
+    group_id: str,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    flush_timeout: float = DEFAULT_FLUSH_TIMEOUT_SECONDS,
     options: ConsumerOptions | None = None,
 ) -> Consumer:
     """SQLite upsert 出口开箱糖：预接 handler/probe/classifier 三件套。
 
     - db：连接串（str 快捷方式）或 DbConfig；
     - upserts：upsert 目标声明（模型 + 幂等键）；
-    - 其余参数与核心 Consumer 逐字一致（未传项回退同名环境变量）；
+    - 其余参数与核心 Consumer 逐字一致（必填项真必填；batch_size /
+      flush_timeout 不传 = 内置默认值）；
     - options 透传合并：传入字段覆盖工厂默认（如换 collapse_key、关 DLQ）。
     """
     return sql_upsert_consumer(

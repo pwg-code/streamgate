@@ -10,8 +10,9 @@
   依赖，可运行演示见仓库 examples/）
 - 呈现归使用方：HTTP 路由/鉴权/OpenAPI、健康端点暴露（包内零 fastapi/uvicorn）
 
-核心依赖仅 aiokafka / loguru / pydantic 三项；核心层不得 import
-streamgate.contrib（import-linter 分层契约强制）。
+核心依赖仅 aiokafka / pydantic 两项；日志为 stdlib logging（库只发记录、
+永不配置，宿主经 logging.getLogger("streamgate") 整树控制）。核心层不得
+import streamgate.contrib（import-linter 分层契约强制）。
 
 生产侧扁平构造：Producer(bootstrap_servers, topic, key, options)
 出口侧扁平构造：Consumer(bootstrap_servers, topic, group_id, handler)
@@ -51,7 +52,6 @@ from streamgate.ingest.producer import (
     Producer,
     ProducerOptions,
 )
-from streamgate.obs.logging import configure_logger, logger
 from streamgate.obs.metrics import LoggingMetricsSink, MetricsSink
 from streamgate.protocols import (
     AllowAllSignal,
@@ -85,7 +85,7 @@ from streamgate.resilience.health import (
 from streamgate.transport.codec import JsonEnvelopeCodec
 from streamgate.transport.kafka import KafkaConsumerService
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"
 
 __all__ = [
     "AllowAllSignal",
@@ -135,8 +135,6 @@ __all__ = [
     "RuntimeTuning",
     "collect_consumer_health",
     "collect_producer_health",
-    "configure_logger",
     "consume_loop",
     "locate_and_quarantine",
-    "logger",
 ]

@@ -1,5 +1,7 @@
 """引擎工厂（读写池/超时钩子/唯一建引擎点）。"""
 
+import logging
+
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -8,8 +10,10 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from streamgate import logger
 from streamgate.contrib.sql_upsert.config import DbConfig
+from streamgate.obs.logging import emit
+
+logger = logging.getLogger(__name__)
 
 
 def make_query_timeout_hook(timeout_seconds: int):
@@ -29,7 +33,7 @@ def make_query_timeout_hook(timeout_seconds: int):
             driver = getattr(dbapi_conn, "driver_connection", dbapi_conn)
             _set_driver_timeout(driver, timeout_seconds)
         except Exception as e:
-            logger.warning("db_query_timeout_set_failed", error=str(e))
+            emit(logger, "warning", "db_query_timeout_set_failed", error=str(e))
 
     return _on_connect
 

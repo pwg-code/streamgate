@@ -1,41 +1,47 @@
 # Configuration reference
 
-streamgate components are configured with typed parameters and Pydantic objects.
-Both the producer and consumer sides take their required settings as flat
-constructor arguments with environment-variable fallback; advanced knobs are
-folded into options objects whose fields map 1:1 to environment variables using
-a `PREFIX__field` convention (double underscore):
+streamgate components are configured with typed parameters and Pydantic
+objects. There are exactly **two sources of truth**:
 
-| Prefix | Config object / component |
-|--------|---------------------------|
-| `KAFKA__` | `KafkaConfig` (via `ProducerOptions.kafka`) + `Consumer` fallbacks |
-| `CONSUMER__` | `Consumer` fallbacks + `ConsumerOptions` |
-| `BACKPRESSURE__` | `BackpressureConfig` |
-| `METRICS__` | metrics window |
+1. **Required settings are true required constructor arguments** —
+   `Producer(bootstrap_servers, topic, ...)` and
+   `Consumer(bootstrap_servers, topic, group_id, handler)`. Missing one fails
+   with a native Python `TypeError` (missing argument) at construction. The
+   library never reads environment variables and never silently defaults a
+   required setting.
+2. **Optional settings directly hold their built-in defaults** — advanced
+   knobs fold into `ProducerOptions` / `ConsumerOptions` (dedup, backpressure,
+   DLQ, tuning, metrics window); omit them and the documented defaults apply.
 
-**Fallback chain (both sides):** explicit argument > environment variable >
-built-in default. **Fail-fast semantics:** required settings without a
-built-in default (topic, group id) fail at construction with an error that
-names the setting and how to fix it.
+If your host wants env-driven configuration, resolve the environment yourself
+and pass the values explicitly (the examples do exactly that with
+`os.environ.get(..., default)`).
 
 Database and Redis connection settings are **not part of the core framework**:
 storage carriers are injected and their configuration belongs to your
 application. The official strategy implementations under `streamgate.contrib`
 ship typed config objects (below) that you construct and pass to the factories.
 
+## Logging (not a configuration surface)
+
+streamgate emits logs through the standard-library `logging` module and ships
+**no logging configuration** — the library only emits records under the
+`streamgate.*` logger tree; level, handlers and formats are configured by the
+host application (e.g. `logging.getLogger("streamgate")`).
+
 ---
 
-## Consumer (flat arguments + env fallbacks)
+## Consumer (flat arguments)
 
-| Argument | Env fallback | Default | Description |
-|----------|--------------|---------|-------------|
-| `bootstrap_servers` | `KAFKA__BOOTSTRAP_SERVERS` | `kafka:9092` | Comma-separated broker list (`http://`/`kafka://` scheme prefixes are stripped). |
-| `topic` | `KAFKA__TOPIC` | **required** | Topic to consume from. Missing ⇒ construction error. |
-| `group_id` | `CONSUMER__GROUP_ID` | **required** | Kafka consumer group id. Missing ⇒ construction error. |
-| `handler` | — (code only) | **required** | Async callable `handler(batch, context)` — the only outlet. |
-| `batch_size` | `CONSUMER__BATCH_SIZE` | `500` | Records buffered before a flush. `1` = single-record real-time. |
-| `flush_timeout` | `CONSUMER__FLUSH_TIMEOUT_SECONDS` | `5.0` | Max wait before a partially filled batch is flushed. |
-| `options` | — | `None` | `ConsumerOptions` — everything below. |
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `bootstrap_servers` | **required** | Comma-separated broker list. Missing ⇒ native `TypeError`. |
+| `topic` | **required** | Topic to consume from. Missing ⇒ native `TypeError`. |
+| `group_id` | **required** | Kafka consumer group id. Missing ⇒ native `TypeError`. |
+| `handler` | **required** | Async callable `handler(batch, context)` — the only outlet. |
+| `batch_size` | `500` | Records buffered before a flush. `1` = single-record real-time. |
+| `flush_timeout` | `5.0` | Max wait before a partially filled batch is flushed. |
+| `options` | `None` | `ConsumerOptions` — everything below. |
 
 ## ConsumerOptions
 
@@ -50,43 +56,41 @@ ship typed config objects (below) that you construct and pass to the factories.
 | `codec` | `JsonEnvelopeCodec` | Message envelope codec. |
 | `health_probe` | `None` | Side-channel health component; implements `check_health()` ⇒ observed in snapshots; `start()`/`close()` ⇒ lifecycle managed. |
 | `backlog_ttl_seconds` | `18000` | Backlog alert budget: WARN > TTL/2, ERROR > TTL×0.8. |
-| `metrics_window_seconds` | `METRICS__WINDOW_SECONDS` → `60` | Sliding-window length (1–600) for rate/latency snapshot fields. |
+| `metrics_window_seconds` | `60` | Sliding-window length (1–600) for rate/latency snapshot fields; out-of-range values fail at construction. |
 | `dlq` | `DlqOptions()` | DLQ options (below). |
 | `tuning` | `RuntimeTuning()` | Runtime tuning (below). |
 
 ## DlqOptions
 
-| Field | Env fallback | Default | Description |
-|-------|--------------|---------|-------------|
-| `enabled` | `CONSUMER__DLQ_ENABLED` | `true` | Master switch; `false` falls back to the paused behavior (emergency escape hatch). |
-| `topic` | `KAFKA__DLQ_TOPIC` | `None` | Dead-letter topic; required when DLQ is enabled. |
-| `message_type` | — | `streamgate_dlq` | Envelope `type` of DLQ messages. |
-| `send_retries` | `CONSUMER__DLQ_SEND_RETRIES` | `3` | Total attempts per DLQ send (exhausting them pauses the batch). |
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `true` | Master switch; `false` falls back to the paused behavior (emergency escape hatch). |
+| `topic` | `None` | Dead-letter topic; required when DLQ is enabled (validated at DLQ-producer construction). |
+| `message_type` | `streamgate_dlq` | Envelope `type` of DLQ messages. |
+| `send_retries` | `3` | Total attempts per DLQ send (exhausting them pauses the batch). |
 
 ## RuntimeTuning
 
-Each field falls back to its `CONSUMER__*` environment variable, then to the
-built-in default:
+Every field directly holds its built-in default:
 
-| Field | Env fallback | Default | Description |
-|-------|--------------|---------|-------------|
-| `max_retries` | `CONSUMER__MAX_RETRIES` | `3` | Handler retries per batch. |
-| `retry_backoff_base` | `CONSUMER__RETRY_BACKOFF_BASE` | `1.0` | Retry backoff base (seconds, exponential). |
-| `reconnect_base` | `CONSUMER__RECONNECT_BASE_BACKOFF_SECONDS` | `1.0` | Reconnect/paused-recovery backoff base (seconds). |
-| `reconnect_max` | `CONSUMER__RECONNECT_MAX_BACKOFF_SECONDS` | `30.0` | Reconnect backoff cap (seconds). |
-| `max_poll_records` | `CONSUMER__MAX_POLL_RECORDS` | `500` | Max records per poll. |
-| `session_timeout_ms` | `CONSUMER__SESSION_TIMEOUT_MS` | `30000` | Kafka session timeout. |
-| `max_poll_interval_ms` | `CONSUMER__MAX_POLL_INTERVAL_MS` | `300000` | Max time between polls before rebalance. |
-| `auto_offset_reset` | `CONSUMER__AUTO_OFFSET_RESET` | `earliest` | Offset reset policy. |
-| `backlog_check_interval` | `CONSUMER__BACKLOG_CHECK_INTERVAL_SECONDS` | `30.0` | Backlog age check period (seconds). |
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_retries` | `3` | Handler retries per batch. |
+| `retry_backoff_base` | `1.0` | Retry backoff base (seconds, exponential). |
+| `reconnect_base` | `1.0` | Reconnect/paused-recovery backoff base (seconds). |
+| `reconnect_max` | `30.0` | Reconnect backoff cap (seconds). |
+| `max_poll_records` | `500` | Max records per poll. |
+| `session_timeout_ms` | `30000` | Kafka session timeout. |
+| `max_poll_interval_ms` | `300000` | Max time between polls before rebalance. |
+| `auto_offset_reset` | `earliest` | Offset reset policy. |
+| `backlog_check_interval` | `30.0` | Backlog age check period (seconds). |
 
 ---
 
 ## Contrib strategy configs
 
-These are plain constructor arguments (not env-mapped). All belong to
-`streamgate.contrib` packages — install the matching extra first
-(`[redis]` / `[sql]` / `[http]`).
+These are plain constructor arguments. All belong to `streamgate.contrib`
+packages — install the matching extra first (`[redis]` / `[sql]` / `[http]`).
 
 ### `contrib.redis_dedup.RedisConfig`
 
@@ -124,23 +128,23 @@ factory entries (`SqliteConsumer` / `MssqlConsumer`).
 
 ### Backpressure probing (contrib.http_probe)
 
-`HttpProbeSignal` consumes the same `BACKPRESSURE__*` environment mapping via
-`BackpressureConfig` (see below) — no extra configuration surface.
+`HttpProbeSignal` is constructed with a `BackpressureConfig` instance (see
+below) — build the config object yourself and pass it to the producer via
+`ProducerOptions(signal=HttpProbeSignal(config), backpressure=config)`.
 
 ---
 
-## KafkaConfig (`ProducerOptions.kafka`, `KAFKA__*`)
+## KafkaConfig (`ProducerOptions.kafka`)
 
-The producer takes `bootstrap_servers`/`topic` as flat constructor arguments
-(see `Producer` above); the remaining connection/self-healing knobs live on
-`KafkaConfig`, injectable via `ProducerOptions.kafka` (defaults below).
-`KAFKA__BOOTSTRAP_SERVERS` / `KAFKA__TOPIC` are also the producer-side
-environment fallbacks.
+The producer takes `bootstrap_servers`/`topic` as **required** flat
+constructor arguments; the remaining connection/self-healing knobs live on
+`KafkaConfig`, injectable via `ProducerOptions.kafka` (defaults below). The
+constructor values always override the `bootstrap_servers` / `topic` fields.
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `bootstrap_servers` | `kafka:9092` | Comma-separated broker list. `http://` / `https://` / `kafka://` scheme prefixes are stripped automatically. Always overridden by the `Producer` constructor value. |
-| `topic` | **required** | Topic to push to (constructor value wins). Missing ⇒ construction error. |
+| `topic` | `None` | Topic to push to (constructor value wins; validated when a raw `KafkaConfig` is used directly). |
 | `acks` | `all` | Producer acks level. |
 | `request_timeout_ms` | `10000` | Producer request timeout (ms). |
 | `enable_idempotence` | `true` | Idempotent producer (safe retries). |
@@ -152,32 +156,31 @@ environment fallbacks.
 | `unhealthy_check_interval_seconds` | `5.0` | High-frequency probe interval while unhealthy/rebuilding. |
 
 The dead-letter topic is configured on the consumer side via
-`DlqOptions.topic` / `KAFKA__DLQ_TOPIC` (see above) — no longer on
-`KafkaConfig`.
+`DlqOptions.topic` (see above) — no longer on `KafkaConfig`.
 
-## BackpressureConfig (`BACKPRESSURE__*`)
+## BackpressureConfig (`ProducerOptions.backpressure`)
 
 The producer defaults to the built-in `ManualBackpressureSignal` (static
 switch, backpressure off). For dynamic probing pass
 `options=ProducerOptions(backpressure=..., signal=...)` —
 `contrib.http_probe.HttpProbeSignal` reads this config object.
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `BACKPRESSURE__ENABLED` | `true` | Master switch; `false` = fully open (emergency rollback). |
-| `BACKPRESSURE__CONSUMER_HEALTH_URL` | `http://localhost:9109/health` | Consumer health endpoint polled by the probe. |
-| `BACKPRESSURE__CHECK_INTERVAL_SECONDS` | `30.0` | Poll period while OPEN. |
-| `BACKPRESSURE__TIMEOUT_SECONDS` | `2.0` | Per-probe timeout. |
-| `BACKPRESSURE__PROBE_RETRIES` | `3` | Retries per cycle (excluding the first attempt); `0` disables. |
-| `BACKPRESSURE__PROBE_RETRY_INTERVAL_SECONDS` | `15.0` | Interval between retries. |
-| `BACKPRESSURE__TRIP_SECONDS` | `9000.0` | Reject when backlog age exceeds this. |
-| `BACKPRESSURE__RECOVER_SECONDS` | `7200.0` | Resume when backlog age falls below this (hysteresis anti-flapping). |
-| `BACKPRESSURE__RETRY_AFTER_SECONDS` | `60` | `Retry-After` hint (seconds) while rejecting. |
-| `BACKPRESSURE__FAIL_CLOSED_ON_UNREACHABLE` | `true` | Treat unreachable probe (retries exhausted) as backlog-exceeded. |
-| `BACKPRESSURE__REJECT_ON_ANY_DEGRADED` | `false` | Legacy escape hatch: reject when any component is degraded. |
-| `BACKPRESSURE__UNHEALTHY_CHECK_INTERVAL_SECONDS` | `5.0` | Poll period while REJECTING. |
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `true` | Master switch; `false` = fully open (emergency rollback). |
+| `consumer_health_url` | `http://localhost:9109/health` | Consumer health endpoint polled by the probe. |
+| `check_interval_seconds` | `30.0` | Poll period while OPEN. |
+| `timeout_seconds` | `2.0` | Per-probe timeout. |
+| `probe_retries` | `3` | Retries per cycle (excluding the first attempt); `0` disables. |
+| `probe_retry_interval_seconds` | `15.0` | Interval between retries. |
+| `trip_seconds` | `9000.0` | Reject when backlog age exceeds this. |
+| `recover_seconds` | `7200.0` | Resume when backlog age falls below this (hysteresis anti-flapping). |
+| `retry_after_seconds` | `60` | `Retry-After` hint (seconds) while rejecting. |
+| `fail_closed_on_unreachable` | `true` | Treat unreachable probe (retries exhausted) as backlog-exceeded. |
+| `reject_on_any_degraded` | `false` | Legacy escape hatch: reject when any component is degraded. |
+| `unhealthy_check_interval_seconds` | `5.0` | Poll period while REJECTING. |
 
-## Metrics window (`METRICS__*`)
+## Metrics window
 
 Health-snapshot rate metrics: both `Producer` and `Consumer` maintain
 in-memory sliding windows and expose computed rates / latencies through their
@@ -185,6 +188,9 @@ health snapshots (`push_rate`, `handle_rate`, `produce_latency_ms_avg`,
 ...). Windowed aggregates are computed on read — no background tasks, no extra
 endpoint; rates decay to `0.0` once traffic stops for longer than the window.
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `METRICS__WINDOW_SECONDS` | `60` | Sliding-window length (seconds) for all rate/latency fields. Valid range 1–600; out-of-range values fail at startup. Short windows react faster but are noisier. |
+Configure via `metrics_window_seconds` on `ProducerOptions` /
+`ConsumerOptions`:
+
+| Value | Description |
+|-------|-------------|
+| `60` (default) | Sliding-window length (seconds) for all rate/latency fields. Valid range 1–600; out-of-range values fail at construction. Short windows react faster but are noisier. |

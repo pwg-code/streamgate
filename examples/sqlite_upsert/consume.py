@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import logging
 import os
 
 from models import Order
@@ -17,6 +18,9 @@ from streamgate.contrib.sqlite_upsert import SqliteConsumer, Upsert
 
 
 async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
     consumer = SqliteConsumer(
         db=os.environ.get("DB_CONN", "sqlite+aiosqlite:///./data/streamgate.db"),
         upserts=[Upsert(model=Order, keys=["order_id"])],

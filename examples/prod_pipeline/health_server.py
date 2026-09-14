@@ -5,8 +5,11 @@
 """
 
 import asyncio
+import logging
 
-from streamgate import Consumer, logger
+from streamgate import Consumer
+
+logger = logging.getLogger(__name__)
 
 
 async def serve_consumer_health(consumer: Consumer, port: int) -> None:
@@ -36,11 +39,11 @@ async def serve_consumer_health(consumer: Consumer, port: int) -> None:
             )
             await writer.drain()
         except Exception as e:
-            logger.debug("health_endpoint_error", error=str(e))
+            logger.debug("health_endpoint_error: %s", e)
         finally:
             writer.close()
 
     server = await asyncio.start_server(_handle, "0.0.0.0", port)
-    logger.info("health_endpoint_listening", port=port)
+    logger.info("health_endpoint_listening: port=%d", port)
     async with server:
         await server.serve_forever()

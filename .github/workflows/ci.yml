@@ -48,7 +48,7 @@ jobs:
 
   bare-install:
     # Regression gate for the pure-core contract: a bare install
-    # (`pip install .`) must pull exactly aiokafka/loguru/pydantic (+transitive),
+    # (`pip install .`) must pull exactly aiokafka/pydantic (+transitive),
     # import cleanly, and run the pure_pipeline example end to end
     # (ingest → Kafka → consume → sqlite sink) against a real broker.
     runs-on: ubuntu-latest

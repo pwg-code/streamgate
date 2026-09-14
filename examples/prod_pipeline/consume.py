@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 
@@ -37,6 +38,9 @@ async def init_db() -> None:
 
 
 async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
     await init_db()
     consumer = MssqlConsumer(
         db=db_conn(),

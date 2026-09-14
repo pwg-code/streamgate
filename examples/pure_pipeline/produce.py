@@ -9,6 +9,7 @@ examples/redis_admission/ 的共享存储载体）。
 """
 
 import asyncio
+import logging
 import os
 
 from models import OrderIn
@@ -22,6 +23,9 @@ def bootstrap_servers() -> str:
 
 
 async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
     producer = Producer(
         bootstrap_servers(),
         topic=os.environ.get("KAFKA__TOPIC", "orders"),

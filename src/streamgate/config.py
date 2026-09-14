@@ -1,9 +1,10 @@
 """streamgate 组件配置对象（每组件独立）。
 
-配置键名与既有环境变量逐字对应（KAFKA__* / CONSUMER__* / BACKPRESSURE__*）。
-1.0.0 起消费侧配置不再经配置对象装配：Consumer 直接以一等参数构造
-（bootstrap_servers/topic/group_id 未传时回退同名环境变量；调优项收口在
-ConsumerOptions.tuning / options.dlq，同样跟随 CONSUMER__* 环境变量回退）。
+3.0.0 起配置只有两个真相来源：必填项显式传入（真必填构造参数），
+可选项直接持有内置默认值——库代码不读取环境变量。消费侧配置不再经
+配置对象装配：Consumer 直接以一等参数构造（bootstrap_servers/topic/
+group_id 为真必填参数；调优项收口在 ConsumerOptions.tuning /
+options.dlq，字段即默认值）。
 DB/Redis 是使用方的世界：连接配置由使用方/示例自带（不进框架核心）。
 """
 
@@ -12,7 +13,8 @@ from pydantic import BaseModel, field_validator
 
 class KafkaConfig(BaseModel):
     bootstrap_servers: str = "kafka:9092"
-    # 必填：producer/consumer 装配时校验（缺失即启动失败，不做项目专属默认）
+    # 直用 KafkaConfig 时必填：Producer/Consumer 构造期已强制显式传入，
+    # 装配时恒以构造参数覆盖此字段
     topic: str | None = None
     acks: str = "all"
     request_timeout_ms: int = 10000
@@ -77,7 +79,6 @@ class MetricsConfig(BaseModel):
     def check_window_seconds(cls, v: int) -> int:
         if not 1 <= v <= 600:
             raise ValueError(
-                "window_seconds out of range; "
-                "set METRICS__WINDOW_SECONDS to a value between 1 and 600"
+                "window_seconds out of range; set a value between 1 and 600"
             )
         return v

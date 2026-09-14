@@ -9,6 +9,7 @@ force 路径）；消费侧 write 成功 → on_persisted（判重与消费侧�
 """
 
 import asyncio
+import logging
 from collections.abc import Callable
 from enum import Enum
 from typing import Generic, TypeVar
@@ -16,9 +17,9 @@ from typing import Generic, TypeVar
 from pydantic import BaseModel
 from redis.exceptions import RedisError
 
-from streamgate import logger
 from streamgate.contrib.redis_dedup.cache import RedisDedupCache
 from streamgate.contrib.redis_dedup.config import RedisConfig
+from streamgate.obs.logging import emit
 from streamgate.protocols import (
     BackfillSource,
     Decision,
@@ -27,6 +28,8 @@ from streamgate.protocols import (
     NoBackfill,
     RejectInfo,
 )
+
+logger = logging.getLogger(__name__)
 
 _REDIS_ERRORS: tuple[type[Exception], ...] = (
     RedisError,
@@ -166,7 +169,7 @@ class RedisDedupCarrier(Generic[RecordModelT]):
             if self._config.fail_closed_on_unavailable:
                 redis_ok, redis_error = await self._cache.check_health_detail()
                 if not redis_ok:
-                    logger.warning(
+                    emit(logger, "warning", 
                         "force_rejected_redis_unavailable",
                         **self._context(identity),
                         error=redis_error,
@@ -204,7 +207,7 @@ class RedisDedupCarrier(Generic[RecordModelT]):
                 return True
             except _REDIS_ERRORS as e:
                 if attempt == 2:
-                    logger.error(
+                    emit(logger, "error", 
                         "force_summary_write_failed",
                         **self._context(identity),
                         error=str(e),
@@ -219,7 +222,7 @@ class RedisDedupCarrier(Generic[RecordModelT]):
         try:
             await self._cache.write_summary(identity, self._summarize(record))
         except Exception as e:
-            logger.warning(
+            emit(logger, "warning", 
                 "cache_refresh_failed",
                 **self._context(identity),
                 error=str(e),
@@ -245,10 +248,10 @@ class RedisDedupCarrier(Generic[RecordModelT]):
         try:
             backfill_map = await self._gated_load(identity)
         except ColdPathGateFullError:
-            logger.warning("cold_path_gate_rejected", **self._context(identity))
+            emit(logger, "warning", "cold_path_gate_rejected", **self._context(identity))
             return self._reject_gate_full()
         except Exception as e:
-            logger.error(
+            emit(logger, "error", 
                 "load_identity_failed", **self._context(identity), error=str(e)
             )
             return self._reject_dependency()
@@ -268,12 +271,12 @@ class RedisDedupCarrier(Generic[RecordModelT]):
         （asyncio.Semaphore 槽位空闲时 acquire 不挂起）。
         """
         if self._cold_gate is None:
-            logger.info("cold_path_load", **self._context(scope))
+            emit(logger, "info", "cold_path_load", **self._context(scope))
             return await self._backfill.load(scope)
         if self._cold_gate.locked():
             raise ColdPathGateFullError(scope)
         async with self._cold_gate:
-            logger.info("cold_path_load", **self._context(scope))
+            emit(logger, "info", "cold_path_load", **self._context(scope))
             return await self._backfill.load(scope)
 
     async def _reserve(
@@ -285,7 +288,7 @@ class RedisDedupCarrier(Generic[RecordModelT]):
             if self._config.fail_closed_on_unavailable:
                 return self._reject_redis_unavailable(error=str(e))
             # 占位失败 -> 无占位继续（ERROR 告警，删 key 修复）；仅配置关闭时可达
-            logger.error(
+            emit(logger, "error", 
                 "reserve_failed_degraded",
                 **self._context(identity),
                 error=str(e),
@@ -299,7 +302,7 @@ class RedisDedupCarrier(Generic[RecordModelT]):
         self, identity: str, error: Exception
     ) -> Decision | None:
         """Redis 故障降级：直查回源库，不回填、不占位。"""
-        logger.warning(
+        emit(logger, "warning", 
             "redis_degraded_direct_backfill",
             **self._context(identity),
             error=str(error),
@@ -307,10 +310,10 @@ class RedisDedupCarrier(Generic[RecordModelT]):
         try:
             backfill_map = await self._gated_load(identity)
         except ColdPathGateFullError:
-            logger.warning("cold_path_gate_rejected", **self._context(identity))
+            emit(logger, "warning", "cold_path_gate_rejected", **self._context(identity))
             return self._reject_gate_full()
         except Exception as db_err:
-            logger.error(
+            emit(logger, "error", 
                 "load_identity_failed_degraded",
                 **self._context(identity),
                 error=str(db_err),
@@ -327,7 +330,7 @@ class RedisDedupCarrier(Generic[RecordModelT]):
         try:
             await self._cache.write_summary(identity, summary)
         except _REDIS_ERRORS as e:
-            logger.warning(
+            emit(logger, "warning", 
                 "cache_backfill_failed", **self._context(identity), error=str(e)
             )
 

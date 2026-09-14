@@ -1,13 +1,16 @@
 """aiokafka 消费封装：拉取/手动提交/健康/lag。"""
 
 import asyncio
+import logging
 
 from aiokafka import AIOKafkaConsumer
 from aiokafka.consumer.group_coordinator import GroupCoordinator
 from aiokafka.errors import CommitFailedError, KafkaConnectionError, KafkaError
 from aiokafka.structs import ConsumerRecord, OffsetAndMetadata, TopicPartition
 
-from streamgate.obs.logging import logger
+from streamgate.obs.logging import emit
+
+logger = logging.getLogger(__name__)
 
 # 反序列化后的消息形态：value_deserializer 产 str（tombstone 为 None），
 # key_deserializer 产 str | None。
@@ -30,14 +33,9 @@ class KafkaConsumerService:
         self._group_id = group_id
         self._topic = topic
         if not self._topic:
-            raise ValueError(
-                "kafka topic is required: pass topic= or set KAFKA__TOPIC"
-            )
+            raise ValueError("kafka topic is required: pass topic=")
         if not group_id:
-            raise ValueError(
-                "consumer group_id is required: pass group_id= "
-                "or set CONSUMER__GROUP_ID"
-            )
+            raise ValueError("consumer group_id is required: pass group_id=")
         self._auto_offset_reset = auto_offset_reset
         self._max_poll_records = max_poll_records
         self._session_timeout_ms = session_timeout_ms
@@ -69,7 +67,7 @@ class KafkaConsumerService:
                 if isinstance(e, KafkaConnectionError)
                 else "kafka_start_failed"
             )
-            logger.error(
+            emit(logger, "error", 
                 event,
                 error=str(e),
                 bootstrap_servers=self._bootstrap_servers,
@@ -77,7 +75,7 @@ class KafkaConsumerService:
             await self._close_safely()
             raise
         self._started = True
-        logger.info(
+        emit(logger, "info", 
             "kafka_connected",
             bootstrap_servers=self._bootstrap_servers,
             group_id=self._group_id,
@@ -90,7 +88,7 @@ class KafkaConsumerService:
         try:
             await self._consumer.stop()
         except Exception as e:
-            logger.debug("kafka_cleanup_error", error=str(e))
+            emit(logger, "debug", "kafka_cleanup_error", error=str(e))
         finally:
             self._consumer = None
             self._started = False
@@ -99,7 +97,7 @@ class KafkaConsumerService:
         if not self._started or self._consumer is None:
             return
         await self._close_safely()
-        logger.info("kafka_disconnected")
+        emit(logger, "info", "kafka_disconnected")
 
     async def poll(self) -> list[KafkaRecord]:
         """拉取一批消息。返回 ConsumerRecord 列表。
@@ -115,7 +113,7 @@ class KafkaConsumerService:
                 max_records=self._max_poll_records,
             )
         except KafkaError as e:
-            logger.error("kafka_poll_failed", error=str(e))
+            emit(logger, "error", "kafka_poll_failed", error=str(e))
             raise
 
         records: list[KafkaRecord] = []
@@ -123,7 +121,7 @@ class KafkaConsumerService:
             for msg in msgs:
                 records.append(msg)
         if records:
-            logger.debug(
+            emit(logger, "debug", 
                 "consumer_message_received",
                 count=len(records),
                 partition=records[-1].partition,
@@ -148,9 +146,9 @@ class KafkaConsumerService:
                 await self._consumer.commit(offsets)
             else:
                 await self._consumer.commit()
-            logger.debug("offset_committed")
+            emit(logger, "debug", "offset_committed")
         except CommitFailedError as e:
-            logger.error("offset_commit_failed", error=str(e))
+            emit(logger, "error", "offset_commit_failed", error=str(e))
             raise
 
     async def check_health(self) -> bool:
@@ -162,7 +160,7 @@ class KafkaConsumerService:
                 timeout=2.0,
             )
         except Exception as e:
-            logger.debug("health_check_failed", error=str(e))
+            emit(logger, "debug", "health_check_failed", error=str(e))
             return False
 
     async def refresh_lag(self) -> None:
@@ -192,7 +190,7 @@ class KafkaConsumerService:
                     total += end - base
             self._lag = total
         except Exception as e:
-            logger.debug("lag_refresh_failed", error=str(e))
+            emit(logger, "debug", "lag_refresh_failed", error=str(e))
 
     @property
     def started(self) -> bool:

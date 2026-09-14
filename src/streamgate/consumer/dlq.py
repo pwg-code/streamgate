@@ -14,13 +14,16 @@
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from aiokafka import AIOKafkaProducer
 
-from streamgate.obs.logging import logger
+from streamgate.obs.logging import emit
 from streamgate.protocols import ErrorKind, JsonObject, Probe
+
+logger = logging.getLogger(__name__)
 
 DLQ_SEND_RETRY_INTERVAL_SECONDS = 1.0  # 发送尝试间隔（隔离路径不在吞吐热区，固定值即可）
 
@@ -88,10 +91,7 @@ class DlqProducer:
         self._bootstrap_servers = bootstrap_servers
         self._topic = topic
         if not self._topic:
-            raise ValueError(
-                "dlq topic is required: set DlqOptions.topic "
-                "or env KAFKA__DLQ_TOPIC"
-            )
+            raise ValueError("dlq topic is required: set DlqOptions.topic")
         self._retries = send_retries
         self._message_type = message_type
         self._request_timeout_ms = request_timeout_ms
@@ -107,7 +107,7 @@ class DlqProducer:
         try:
             await self._connect()
         except Exception as e:
-            logger.error("dlq_producer_startup_failed", error=str(e), topic=self._topic)
+            emit(logger, "error", "dlq_producer_startup_failed", error=str(e), topic=self._topic)
 
     async def _connect(self) -> None:
         producer = AIOKafkaProducer(
@@ -128,7 +128,7 @@ class DlqProducer:
             raise
         self._producer = producer
         self._started = True
-        logger.info("dlq_producer_connected", topic=self._topic)
+        emit(logger, "info", "dlq_producer_connected", topic=self._topic)
 
     async def _close_safely(self) -> None:
         if self._producer is None:
@@ -137,7 +137,7 @@ class DlqProducer:
         try:
             await self._producer.stop()
         except Exception as e:
-            logger.debug("dlq_producer_cleanup_error", error=str(e))
+            emit(logger, "debug", "dlq_producer_cleanup_error", error=str(e))
         finally:
             self._producer = None
             self._started = False
@@ -145,7 +145,7 @@ class DlqProducer:
     async def stop(self) -> None:
         self._closed = True
         await self._close_safely()
-        logger.info("dlq_producer_disconnected")
+        emit(logger, "info", "dlq_producer_disconnected")
 
     async def quarantine(self, request: QuarantineRequest) -> None:
         """隔离单条消息至 DLQ。成功静默返回；重试耗尽抛 DlqSendError。
@@ -165,7 +165,7 @@ class DlqProducer:
                 return
             except Exception as e:
                 last_error = e
-                logger.warning(
+                emit(logger, "warning", 
                     "dlq_send_attempt_failed",
                     attempt=attempt,
                     retries=self._retries,
@@ -177,7 +177,7 @@ class DlqProducer:
                 await self._close_safely()
                 if attempt < self._retries:
                     await asyncio.sleep(DLQ_SEND_RETRY_INTERVAL_SECONDS)
-        logger.error(
+        emit(logger, "error", 
             "dlq_send_failed",
             retries=self._retries,
             topic=self._topic,
@@ -361,7 +361,7 @@ async def locate_and_quarantine(
     except _ProbeAborted as e:
         # 对照失败：可能已有部分条目处理完成（幂等，paused 重试时无害重跑），
         # 但本轮绝不隔离任何数据、不推进位点
-        logger.error(
+        emit(logger, "error", 
             "bisect_aborted_probe_failed",
             batch_size=len(batch),
             handled=len(outcome.handled),

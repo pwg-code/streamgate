@@ -8,6 +8,10 @@
 import dataclasses
 
 from streamgate import Consumer, ConsumerOptions
+from streamgate.consumer.runner import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_FLUSH_TIMEOUT_SECONDS,
+)
 from streamgate.contrib.sql_upsert.classifier import SQLAlchemyErrorClassifier
 from streamgate.contrib.sql_upsert.config import DbConfig
 from streamgate.contrib.sql_upsert.upsert import Upsert, upsert_outlet
@@ -47,15 +51,17 @@ def sql_upsert_consumer(
     *,
     db: DbConfig,
     upserts: list[Upsert],
-    bootstrap_servers: str | None,
-    topic: str | None,
-    group_id: str | None,
-    batch_size: int | None,
-    flush_timeout: float | None,
+    bootstrap_servers: str,
+    topic: str,
+    group_id: str,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    flush_timeout: float = DEFAULT_FLUSH_TIMEOUT_SECONDS,
     options: ConsumerOptions | None,
 ) -> Consumer:
     """预装配 SQL 出口 Consumer：handler/probe/classifier 三件套生效。
 
+    必填项（bootstrap_servers/topic/group_id）真必填；batch_size /
+    flush_timeout 不传 = 核心内置默认值。
     建表行为由出口载体 start() 决定（sqlite 自动建表；mssql 交迁移工具）。
     """
     handler, probe = upsert_outlet(db, upserts)

@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import logging
 import os
 
 from models import OrderIn
@@ -13,6 +14,9 @@ from streamgate import Producer, ProducerOptions
 
 
 async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
     producer = Producer(
         os.environ.get("KAFKA__BOOTSTRAP_SERVERS", "localhost:29092"),
         topic=os.environ.get("KAFKA__TOPIC", "orders"),
