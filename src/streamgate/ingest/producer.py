@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from typing import Generic, TypeVar, cast
 
 from aiokafka import AIOKafkaProducer
-from aiokafka.errors import KafkaConnectionError, KafkaError
+from aiokafka.errors import KafkaConnectionError, KafkaError, KafkaTimeoutError
 from pydantic import BaseModel
 
 from streamgate.config import BackpressureConfig, KafkaConfig
@@ -66,6 +66,10 @@ RecordT = TypeVar("RecordT", bound=BaseModel)
 DEFAULT_MESSAGE_TYPE = "streamgate_record"
 DEFAULT_METRICS_WINDOW_SECONDS = 60
 METRICS_WINDOW_RANGE = (1, 600)
+
+# 发送等待上界的默认宽限（秒）：request_timeout_ms 只约束单次请求与缓冲排队，
+# 不覆盖幂等 producer「失败就无限重试」的循环，故在其上再加固定宽限。
+SEND_TIMEOUT_GRACE_SECONDS = 5.0
 
 # 旧参数 → 迁移指引（收到即报错，指向 CHANGELOG 迁移指南）
 _MIGRATION_HINT = (
@@ -103,6 +107,15 @@ async def _lifecycle_close(component: object) -> None:
     close: Callable[[], Awaitable[None]] | None = getattr(component, "close", None)
     if close is not None:
         await close()
+
+
+def _consume_task_exception(task: asyncio.Task[None]) -> None:
+    """消费后台停止任务的异常（避免 "exception was never retrieved"）。"""
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        emit(logger, "debug", "kafka_cleanup_error", error=str(error))
 
 
 @dataclass
@@ -230,7 +243,7 @@ class _KafkaClient:
                     attempt=self._reconnect_attempt,
                 )
                 try:
-                    await producer.stop()
+                    await self._stop_producer(producer)
                 except Exception as close_e:
                     emit(logger, "debug", "kafka_cleanup_error", error=str(close_e))
                 raise
@@ -283,12 +296,13 @@ class _KafkaClient:
         """连续重试直到成功（指数退避，对齐 consumer 重连策略）。
 
         失败按 backoff 指数退避后立即再试，不回落到探活间隔。
+        关闭在锁外进行：_close_safely 自带加锁，且其有界 stop 不应在
+        持锁期间阻塞 send/check_health。
         """
         while not self._closed:
-            async with self._lock:
-                if self._closed:
-                    return
-                await self._close_safely()
+            await self._close_safely()
+            if self._closed:
+                return
             try:
                 await self._connect()
                 return
@@ -343,23 +357,64 @@ class _KafkaClient:
                 self._consecutive_failures = 0
 
     async def _close_safely(self) -> None:
-        if self._producer is None:
-            self._started = False
-            return
-        try:
-            await self._producer.stop()
-        except Exception as e:
-            emit(logger, "debug", "kafka_cleanup_error", error=str(e))
-        finally:
+        """摘除当前 producer 后停止（有界）。
+
+        先在锁内摘引用、清 _started，让并发 send 立即快速失败（而不是
+        阻塞在锁上）；停止在锁外进行，避免无界 flush 把自愈监控与优雅
+        停机一起拖住。
+        """
+        async with self._lock:
+            producer = self._producer
             self._producer = None
             self._started = False
+        if producer is None:
+            return
+        try:
+            await self._stop_producer(producer)
+        except Exception as e:
+            emit(logger, "debug", "kafka_cleanup_error", error=str(e))
+
+    async def _stop_producer(self, producer: AIOKafkaProducer) -> None:
+        """有界停止：超时后把清理留给后台继续，不阻塞调用方。
+
+        aiokafka 的 stop() 会 flush 全部未完成批次；幂等模式下批次永不
+        过期，broker 不可达时 stop() 本身就没有上界。这里只限制"等待"，
+        不取消底层清理，避免留下永不结束的 sender 重试循环。
+        """
+        timeout = self._resolved_close_timeout_seconds()
+        if timeout is None:
+            await producer.stop()
+            return
+        stopper = asyncio.ensure_future(producer.stop())
+        stopper.add_done_callback(_consume_task_exception)
+        try:
+            await asyncio.wait_for(asyncio.shield(stopper), timeout=timeout)
+        except TimeoutError:
+            emit(logger, "warning",
+                "kafka_producer_stop_timeout",
+                timeout_seconds=timeout,
+            )
+
+    def _resolved_send_timeout_seconds(self) -> float | None:
+        """发送等待上界：配置优先；None → request_timeout_ms + 宽限；0 → 关闭。"""
+        configured = self._config.send_timeout_seconds
+        if configured is not None:
+            return configured if configured > 0 else None
+        return self._config.request_timeout_ms / 1000 + SEND_TIMEOUT_GRACE_SECONDS
+
+    def _resolved_close_timeout_seconds(self) -> float | None:
+        """关闭上界：配置优先；None → 同发送上界；0 → 关闭。"""
+        configured = self._config.close_timeout_seconds
+        if configured is not None:
+            return configured if configured > 0 else None
+        return self._resolved_send_timeout_seconds()
 
     async def stop(self) -> None:
         async with self._lock:
             self._closed = True
             task = self._monitor_task
             self._monitor_task = None
-            await self._close_safely()
+        await self._close_safely()
         if task is not None:
             task.cancel()
             try:
@@ -369,35 +424,56 @@ class _KafkaClient:
         emit(logger, "info", "kafka_disconnected")
 
     async def send(self, key: str | None, message: JsonObject) -> None:
-        """发送单条消息。key=None 时不带路由键（轮询分区、不保序）。"""
+        """发送单条消息。key=None 时不带路由键（轮询分区、不保序）。
+
+        等待有上界（send_timeout_seconds）：幂等 producer 在 broker 不可达
+        时会无限重试批次，aiokafka 0.14 没有投递超时，必须在这里兜住。
+        语义边界：上界只保证"等待有界"，不保证"未投递"——已进入
+        accumulator 的消息在取消等待后仍可能迟到投递。
+        """
         async with self._lock:
             if self._closed or not self._started or self._producer is None:
                 self._rejected_requests += 1
                 raise RuntimeError("_KafkaClient is not started")
             producer = self._producer
         payload = json.dumps(message, ensure_ascii=False, default=str)
+        timeout = self._resolved_send_timeout_seconds()
         try:
-            await producer.send_and_wait(
-                topic=self._topic,
-                key=key,
-                value=payload,
+            await asyncio.wait_for(
+                producer.send_and_wait(
+                    topic=self._topic,
+                    key=key,
+                    value=payload,
+                ),
+                timeout=timeout,
             )
+        except TimeoutError as e:
+            # 必须转成 KafkaError 子类：裸 TimeoutError 会绕过失败计数、
+            # _last_failure_at 与达阈值重建。
+            error = KafkaTimeoutError(
+                f"kafka send wait exceeded {timeout}s bounded timeout"
+            )
+            await self._record_send_failure(key, error)
+            raise error from e
         except KafkaError as e:
-            now = datetime.now(timezone.utc)
-            self._last_failure_at = now
-            self._rejected_requests += 1
-            self._consecutive_failures += 1
-            emit(logger, "error", 
-                "kafka_send_failed",
-                key=key,
-                topic=self._topic,
-                error=str(e),
-                consecutive_failures=self._consecutive_failures,
-            )
-            # R1：连续失败达阈值即触发异步重建（单飞行防抖）
-            if self._consecutive_failures >= self._config.reconnect_failure_threshold:
-                await self._trigger_reconnect()
+            await self._record_send_failure(key, e)
             raise
+
+    async def _record_send_failure(self, key: str | None, error: KafkaError) -> None:
+        """统一失败记录：时间戳、计数、观测事件、达阈值触发重建。"""
+        self._last_failure_at = datetime.now(timezone.utc)
+        self._rejected_requests += 1
+        self._consecutive_failures += 1
+        emit(logger, "error",
+            "kafka_send_failed",
+            key=key,
+            topic=self._topic,
+            error=str(error),
+            consecutive_failures=self._consecutive_failures,
+        )
+        # R1：连续失败达阈值即触发异步重建（单飞行防抖）
+        if self._consecutive_failures >= self._config.reconnect_failure_threshold:
+            await self._trigger_reconnect()
 
     async def check_health(self) -> bool:
         async with self._lock:

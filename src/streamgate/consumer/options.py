@@ -34,6 +34,11 @@ class DlqOptions:
     topic: str | None = None          # 启用（enabled=True）时必填
     message_type: str = "streamgate_dlq"
     send_retries: int = 3
+    # 单次 DLQ 发送的等待上界（秒）：None = request_timeout_ms + 5s 宽限；
+    # 0 = 无界（旧行为）。上界只保证"等待有界"，不保证"未投递"。
+    send_timeout_seconds: float | None = None
+    # 销毁/重建 DLQ producer 时 stop() 的上界（秒）：None = 同 send 上界；0 = 无界。
+    close_timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True)

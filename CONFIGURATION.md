@@ -89,6 +89,8 @@ attribute set is shared as `streamgate.obs.logging.RESERVED_RECORD_ATTRS`.
 | `topic` | `None` | Dead-letter topic; required when DLQ is enabled (validated at DLQ-producer construction). |
 | `message_type` | `streamgate_dlq` | Envelope `type` of DLQ messages. |
 | `send_retries` | `3` | Total attempts per DLQ send (exhausting them pauses the batch). |
+| `send_timeout_seconds` | `None` | Wall-clock ceiling per DLQ send attempt. `None` = `request_timeout_ms (10000) + 5s`; `0` = unbounded. Timeout counts as a failed attempt (batch stays paused, offset not advanced); it does **not** guarantee the message was undelivered. |
+| `close_timeout_seconds` | `None` | Ceiling for `producer.stop()` when destroying a failed DLQ producer. `None` = same as `send_timeout_seconds`; `0` = unbounded. |
 
 ## RuntimeTuning
 
@@ -167,8 +169,10 @@ constructor values always override the `bootstrap_servers` / `topic` fields.
 | `bootstrap_servers` | `kafka:9092` | Comma-separated broker list. `http://` / `https://` / `kafka://` scheme prefixes are stripped automatically. Always overridden by the `Producer` constructor value. |
 | `topic` | `None` | Topic to push to (constructor value wins; validated when a raw `KafkaConfig` is used directly). |
 | `acks` | `all` | Producer acks level. |
-| `request_timeout_ms` | `10000` | Producer request timeout (ms). |
+| `request_timeout_ms` | `10000` | Producer request timeout (ms). Bounds a single request / buffer wait only — **not** delivery (idempotent mode retries batches indefinitely). |
 | `enable_idempotence` | `true` | Idempotent producer (safe retries). |
+| `send_timeout_seconds` | `None` | Wall-clock ceiling for waiting on a send ack. `None` = `request_timeout_ms/1000 + 5s`; `0` = unbounded (pre-3.2.0 behaviour). On timeout `push()` returns `unavailable` (⇒ 503) and the send-failure path (rollback hook, failure counter, rebuild trigger) runs. **The ceiling bounds the wait, not delivery**: a message already in the accumulator may still be delivered late. |
+| `close_timeout_seconds` | `None` | Ceiling for `producer.stop()` during close/rebuild. `None` = same as `send_timeout_seconds`; `0` = unbounded. Prevents an undeliverable batch from blocking self-healing and graceful shutdown. |
 | `health_check_interval_seconds` | `30.0` | Periodic health probe interval; unhealthy instances are rebuilt. |
 | `reconnect_base_backoff_seconds` | `1.0` | Reconnect exponential backoff base. |
 | `reconnect_max_backoff_seconds` | `30.0` | Reconnect backoff cap. |

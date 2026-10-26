@@ -26,6 +26,18 @@ from streamgate.protocols import ErrorKind, JsonObject, Probe
 logger = logging.getLogger(__name__)
 
 DLQ_SEND_RETRY_INTERVAL_SECONDS = 1.0  # 发送尝试间隔（隔离路径不在吞吐热区，固定值即可）
+# 发送等待上界的默认宽限（秒）：幂等 producer 在 broker 不可达时无限重试批次，
+# request_timeout_ms 只约束单次请求，不构成投递超时。
+DLQ_SEND_TIMEOUT_GRACE_SECONDS = 5.0
+
+
+def _consume_task_exception(task: asyncio.Task[None]) -> None:
+    """消费后台停止任务的异常（避免 "exception was never retrieved"）。"""
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        emit(logger, "debug", "dlq_producer_cleanup_error", error=str(error))
 
 
 @dataclass
@@ -87,6 +99,8 @@ class DlqProducer:
         send_retries: int = 3,
         message_type: str = "streamgate_dlq",
         request_timeout_ms: int = 10000,
+        send_timeout_seconds: float | None = None,
+        close_timeout_seconds: float | None = None,
     ) -> None:
         self._bootstrap_servers = bootstrap_servers
         self._topic = topic
@@ -95,9 +109,26 @@ class DlqProducer:
         self._retries = send_retries
         self._message_type = message_type
         self._request_timeout_ms = request_timeout_ms
+        # None = 派生 request_timeout_ms + 宽限；0 = 关闭（旧的无界等待）
+        self._send_timeout_seconds = send_timeout_seconds
+        self._close_timeout_seconds = close_timeout_seconds
         self._producer: AIOKafkaProducer | None = None
         self._started: bool = False
         self._closed: bool = False
+
+    def _resolved_send_timeout_seconds(self) -> float | None:
+        """发送等待上界：配置优先；None → request_timeout_ms + 宽限；0 → 关闭。"""
+        configured = self._send_timeout_seconds
+        if configured is not None:
+            return configured if configured > 0 else None
+        return self._request_timeout_ms / 1000 + DLQ_SEND_TIMEOUT_GRACE_SECONDS
+
+    def _resolved_close_timeout_seconds(self) -> float | None:
+        """关闭上界：配置优先；None → 同发送上界；0 → 关闭。"""
+        configured = self._close_timeout_seconds
+        if configured is not None:
+            return configured if configured > 0 else None
+        return self._resolved_send_timeout_seconds()
 
     async def start(self) -> None:
         """启动（幂等）。失败仅记 ERROR 日志不抛：quarantine 内懒启动兜底，
@@ -122,7 +153,7 @@ class DlqProducer:
             await producer.start()
         except Exception:
             try:
-                await producer.stop()
+                await self._stop_producer(producer)
             except Exception:
                 pass  # 清理失败无碍：实例已弃用，重建时换新对象
             raise
@@ -131,16 +162,32 @@ class DlqProducer:
         emit(logger, "info", "dlq_producer_connected", topic=self._topic)
 
     async def _close_safely(self) -> None:
-        if self._producer is None:
-            self._started = False
+        """摘引用后停止（有界）：无界 flush 会卡住隔离路径的 paused 恢复。"""
+        producer = self._producer
+        self._producer = None
+        self._started = False
+        if producer is None:
             return
         try:
-            await self._producer.stop()
+            await self._stop_producer(producer)
         except Exception as e:
             emit(logger, "debug", "dlq_producer_cleanup_error", error=str(e))
-        finally:
-            self._producer = None
-            self._started = False
+
+    async def _stop_producer(self, producer: AIOKafkaProducer) -> None:
+        """有界停止：超时后把清理留给后台继续，不阻塞调用方。"""
+        timeout = self._resolved_close_timeout_seconds()
+        if timeout is None:
+            await producer.stop()
+            return
+        stopper = asyncio.ensure_future(producer.stop())
+        stopper.add_done_callback(_consume_task_exception)
+        try:
+            await asyncio.wait_for(asyncio.shield(stopper), timeout=timeout)
+        except TimeoutError:
+            emit(logger, "warning",
+                "dlq_producer_stop_timeout",
+                timeout_seconds=timeout,
+            )
 
     async def stop(self) -> None:
         self._closed = True
@@ -191,16 +238,24 @@ class DlqProducer:
         )
 
     async def _send_once(self, request: QuarantineRequest, value: str) -> None:
-        """单次发送（懒启动：覆盖启动期 broker 不可用）。"""
+        """单次发送（懒启动：覆盖启动期 broker 不可用）。
+
+        等待有上界：幂等 producer 在 broker 不可达时会无限重试批次。
+        超时抛 TimeoutError 由 quarantine 的重试循环接住；上界只保证
+        "等待有界"，不保证"未投递"（已入 accumulator 的消息仍可能迟到投递）。
+        """
         if not self._started:
             await self._connect()
         producer = self._producer
         if producer is None:
             raise RuntimeError("DLQ producer not connected")
-        await producer.send_and_wait(
-            topic=self._topic,
-            key=request.key,
-            value=value,
+        await asyncio.wait_for(
+            producer.send_and_wait(
+                topic=self._topic,
+                key=request.key,
+                value=value,
+            ),
+            timeout=self._resolved_send_timeout_seconds(),
         )
 
 

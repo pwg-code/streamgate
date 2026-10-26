@@ -19,6 +19,14 @@ class KafkaConfig(BaseModel):
     acks: str = "all"
     request_timeout_ms: int = 10000
     enable_idempotence: bool = True
+    # 发送等待上界（秒）。幂等 producer 在 broker 不可达时会无限重试批次，
+    # request_timeout_ms 只约束单次请求/缓冲排队，不构成投递超时；必须有
+    # 墙钟上界，否则调用方会无限挂起且失败钩子永不触发。
+    # None = 派生为 request_timeout_ms/1000 + 5s 宽限；0 = 关闭（旧的无界等待）。
+    send_timeout_seconds: float | None = None
+    # 关闭/重建时 producer.stop() 的上界（秒）：无界 flush 会卡住自愈与优雅停机。
+    # None = 同 send_timeout_seconds；0 = 关闭（旧的无界等待）。
+    close_timeout_seconds: float | None = None
     # 自愈监控：周期性探活，不健康时销毁旧实例重建连接（覆盖启动期/运行期断线）
     health_check_interval_seconds: float = 30.0   # 探活轮询周期
     reconnect_base_backoff_seconds: float = 1.0   # 重连指数退避基数
@@ -45,6 +53,14 @@ class KafkaConfig(BaseModel):
                     break
             cleaned.append(part)
         return ",".join(cleaned)
+
+    @field_validator("send_timeout_seconds", "close_timeout_seconds")
+    @classmethod
+    def check_non_negative_timeout(cls, v: float | None) -> float | None:
+        """0 表示关闭上界（保留旧行为），负值无意义。"""
+        if v is not None and v < 0:
+            raise ValueError("timeout must be >= 0 (0 disables the bound)")
+        return v
 
 
 class BackpressureConfig(BaseModel):

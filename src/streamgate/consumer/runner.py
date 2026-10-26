@@ -113,6 +113,8 @@ class Consumer:
             topic=dlq_options.topic,
             send_retries=dlq_options.send_retries,
             message_type=dlq_options.message_type,
+            send_timeout_seconds=dlq_options.send_timeout_seconds,
+            close_timeout_seconds=dlq_options.close_timeout_seconds,
         )
 
     async def prepare(self) -> ConsumeRuntime:

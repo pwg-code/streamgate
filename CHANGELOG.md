@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-10-26
+
+### Added
+
+- **Bounded send wait** — `KafkaConfig.send_timeout_seconds` (default `None` ⇒
+  `request_timeout_ms/1000 + 5s`, i.e. 15s with stock settings; `0` disables).
+  `_KafkaClient.send` now wraps `send_and_wait` in `asyncio.wait_for` and maps
+  the timeout to `KafkaTimeoutError` (a `KafkaError` subclass), so the existing
+  failure path runs: `kafka_send_failed`, `_last_failure_at`, the consecutive
+  failure counter, `reconnect_failure_threshold` rebuild, `on_send_failed`, and
+  `PushResult.unavailable` (⇒ 503 at the host's adapter). Prior behaviour: the
+  in-flight send could wait indefinitely — aiokafka 0.14 has no delivery
+  timeout, and with `enable_idempotence=True` batches never expire
+  (`_can_retry` short-circuits `batch.expired()`), so during a broker outage a
+  request could hang until the client gave up while no failure hook ever fired.
+- **Bounded shutdown / rebuild wait** — `KafkaConfig.close_timeout_seconds`
+  (default `None` ⇒ same as `send_timeout_seconds`; `0` disables). `producer
+  .stop()` flushes pending batches and is itself unbounded in the same
+  scenario; `_close_safely` now detaches the producer and clears `_started`
+  under the lock first (concurrent sends fail fast instead of blocking on the
+  lock), then performs the bounded stop outside the lock. On timeout it emits
+  `kafka_producer_stop_timeout` (warning) and lets the cleanup finish in the
+  background, so self-healing and graceful shutdown are no longer held hostage
+  by an undeliverable batch.
+- **DLQ parity** — `DlqOptions.send_timeout_seconds` / `close_timeout_seconds`
+  (same defaults and disable semantics), wired through `DlqProducer`. A DLQ
+  send timeout counts as a failed attempt: the consumer stays paused and does
+  not advance the offset (the "return ⟺ written to DLQ" invariant is intact).
+
+### Changed
+
+- **Behaviour change in the outage/slow-cluster window** (intentional, no API
+  break): sends that previously waited indefinitely and might eventually
+  succeed now fail after the ceiling and surface as `unavailable` / 503.
+  Normal-path latency is unchanged (`wait_for` adds no RTT). The ceiling bounds
+  the **wait, not delivery**: a message already in the accumulator may still be
+  delivered late after the caller has been told it failed. If dedup is enabled,
+  the default `on_send_failed` keeps the placeholder, so a retried push is
+  reported as a duplicate — hosts that need "retry after 503" semantics should
+  release the placeholder in `on_send_failed` or rely on their own idempotency
+  key (this trade-off already existed for any `KafkaError`; it is now reachable
+  via timeout too).
+- New observability event: `kafka_producer_stop_timeout` (warning, producer)
+  and `dlq_producer_stop_timeout` (warning, consumer).
+
 ## [3.1.0] - 2026-09-14
 
 ### Added
